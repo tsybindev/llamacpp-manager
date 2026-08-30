@@ -49,28 +49,6 @@ pub struct ParamsCatalog {
     #[serde(default)]
     pub source: String,
     pub params: Vec<ParamDef>,
-}
-
-impl ParamsCatalog {
-    pub fn categories(&self) -> Vec<(&'static str, &'static str)> {
-        // Stable order of known categories; unknown ones are appended by
-        // first appearance in the catalog.
-        let mut known: Vec<(&'static str, &'static str)> = vec![
-            ("context", "Модель и контекст"),
-            ("gpu", "GPU и разгрузка"),
-            ("kv", "Память и KV-кэш"),
-            ("spec", "Спекулятивный декодинг (draft)"),
-            ("sampling", "Сэмплинг"),
-            ("server", "HTTP-сервер"),
-        ];
-        let known_ids: Vec<&str> = known.iter().map(|(id, _)| *id).collect();
-        for p in &self.params {
-            if !known_ids.contains(&p.category.as_str()) {
-                known.push((Box::leak(p.category.clone().into_boxed_str()), "(другое)"));
-            }
-        }
-        known
-    }
 
 }
 

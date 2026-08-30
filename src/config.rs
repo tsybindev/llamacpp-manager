@@ -45,6 +45,8 @@ pub struct Settings {
     pub hf_token: String,
     pub theme: ThemeMode,
     pub sidebar_collapsed: bool,
+    /// UI zoom factor (0.8–1.5).
+    pub ui_zoom: f32,
     /// When true, the logger also records debug-level messages.
     pub debug_logging: bool,
     pub auto_restore: AutoRestore,
@@ -67,6 +69,7 @@ impl Default for Settings {
             hf_token: String::new(),
             theme: ThemeMode::System,
             sidebar_collapsed: false,
+            ui_zoom: 1.0,
             debug_logging: false,
             auto_restore: AutoRestore::default(),
             params_catalog_url: DEFAULT_PARAMS_CATALOG_URL.to_string(),

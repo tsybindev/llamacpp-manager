@@ -1,19 +1,22 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use egui::{Color32, RichText, ScrollArea};
+use egui::ScrollArea;
 
 use crate::builds;
 use crate::config::{self, Settings};
 use crate::github;
 use crate::gguf;
 use crate::huggingface;
-use crate::logger::{self, LogHandle, LogEntry};
-use crate::params::{self, ParamDef, ParamKind, ParamsCatalog, ParamState};
+use crate::logger::{self, LogHandle};
+use crate::params;
+use crate::params::ParamsCatalog;
 use crate::presets::{self, Preset};
-use crate::process_mgr::{ServerConfig, ServerState, ServerManager};
+use crate::process_mgr::{ServerConfig, ServerManager};
 use crate::theme::{self, ThemeMode};
+use crate::ui;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Page {
@@ -26,135 +29,152 @@ pub enum Page {
 impl Page {
     const ALL: [Page; 4] = [Page::Server, Page::Models, Page::Builds, Page::Settings];
 
-    fn icon(self) -> &'static str {
+    pub fn icon(self) -> &'static str {
         match self {
-            Page::Server => "🖥",
-            Page::Models => "📦",
-            Page::Builds => "⚙️",
-            Page::Settings => "🔧",
+            Page::Server => "▦",
+            Page::Models => "⛁",
+            Page::Builds => "⧉",
+            Page::Settings => "⚙",
         }
     }
 
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
-            Page::Server => "🖥  Сервер",
-            Page::Models => "📦  Модели",
-            Page::Builds => "⚙️  Сборки",
-            Page::Settings => "🔧  Настройки",
+            Page::Server => "Сервер",
+            Page::Models => "Модели",
+            Page::Builds => "Сборки",
+            Page::Settings => "Настройки",
         }
     }
 
-    fn title(self) -> &'static str {
+    pub fn title(self) -> &'static str {
         match self {
             Page::Server => "Управление сервером",
-            Page::Models => "Модели (HuggingFace)",
+            Page::Models => "Модели",
             Page::Builds => "Сборки llama.cpp",
             Page::Settings => "Настройки",
+        }
+    }
+
+    pub fn subtitle(self) -> &'static str {
+        match self {
+            Page::Server => "llama-server",
+            Page::Models => "HuggingFace и локальная библиотека",
+            Page::Builds => "релизы llama.cpp",
+            Page::Settings => "",
         }
     }
 }
 
 pub struct App {
-    page: Page,
-    settings: Settings,
-    applied_theme: Option<ThemeMode>,
-    sidebar_collapsed: bool,
-    log_handle: Option<LogHandle>,
-    config_dirty: bool,
-    last_change: Option<Instant>,
-    server: ServerManager,
-    server_form: ServerForm,
-    params_catalog: ParamsCatalog,
-    presets: presets::PresetStore,
+    pub page: Page,
+    pub settings: Settings,
+    pub applied_theme: Option<ThemeMode>,
+    pub sidebar_collapsed: bool,
+    pub log_handle: Option<LogHandle>,
+    pub config_dirty: bool,
+    pub last_change: Option<Instant>,
+    pub server: ServerManager,
+    pub server_form: ServerForm,
+    pub params_catalog: ParamsCatalog,
+    pub presets: presets::PresetStore,
     /// Preset picked in the combo box, if any.
-    selected_preset: Option<String>,
+    pub selected_preset: Option<String>,
     /// Mirror of `selected_preset` to detect selection changes and sync
     /// the name input field with the picked preset.
-    mirrored_preset: Option<String>,
+    pub mirrored_preset: Option<String>,
     /// Name input used for save/rename/import operations.
-    preset_name_edit: String,
+    pub preset_name_edit: String,
     /// Second-click confirmation state for the delete button.
-    preset_delete_armed: bool,
+    pub preset_delete_armed: bool,
     /// Result of the last preset operation: (is_error, message).
-    preset_msg: Option<(bool, String)>,
+    pub preset_msg: Option<(bool, String)>,
+    /// Активная вкладка параметров на странице «Сервер».
+    pub params_tab: usize,
+    /// Фильтр уровней журнала приложения: [info, warn, error, debug].
+    pub log_filter: [bool; 4],
     // --- Состояние страницы «Сборки» ---
     /// Список релизов llama.cpp (из кэша или сети).
-    build_releases: Option<Vec<github::Release>>,
+    pub build_releases: Option<Vec<github::Release>>,
     /// Канал фонового обновления списка релизов.
-    build_releases_rx: Option<mpsc::Receiver<Result<Vec<github::Release>, String>>>,
-    build_releases_loading: bool,
-    build_releases_error: Option<String>,
-    /// Фильтр списка релизов: тег версии (b10690) или бэкенд (vulkan).
-    build_filter: String,
+    pub build_releases_rx: Option<mpsc::Receiver<Result<Vec<github::Release>, String>>>,
+    pub build_releases_loading: bool,
+    pub build_releases_error: Option<String>,
+    /// Фильтр списка релизов по бэкенду (None = все).
+    pub build_backend_filter: Option<github::Backend>,
     /// Показывать все релизы (по умолчанию — только 5 последних).
-    build_show_all: bool,
+    pub build_show_all: bool,
     /// Текущее скачивание/установка сборки, если идёт.
-    build_download: Option<BuildDownload>,
+    pub build_download: Option<BuildDownload>,
     /// Сборка, ожидающая подтверждения удаления (второй щелчок).
-    build_delete_armed: Option<PathBuf>,
+    pub build_delete_armed: Option<PathBuf>,
     // --- Состояние страницы «Модели» ---
-    hf_query: String,
-    hf_results: Option<Vec<huggingface::HfModel>>,
-    hf_search_rx: Option<mpsc::Receiver<Result<Vec<huggingface::HfModel>, String>>>,
-    hf_searching: bool,
+    pub hf_query: String,
+    pub hf_results: Option<Vec<huggingface::HfModel>>,
+    pub hf_search_rx: Option<mpsc::Receiver<Result<Vec<huggingface::HfModel>, String>>>,
+    pub hf_searching: bool,
     /// Репозиторий, выбранный из результатов поиска.
-    hf_selected_repo: Option<String>,
-    hf_files: Vec<huggingface::HfFile>,
-    hf_files_rx: Option<mpsc::Receiver<Result<Vec<huggingface::HfFile>, String>>>,
-    hf_error: Option<String>,
+    pub hf_selected_repo: Option<String>,
+    pub hf_files: Vec<huggingface::HfFile>,
+    pub hf_files_rx: Option<mpsc::Receiver<Result<Vec<huggingface::HfFile>, String>>>,
+    pub hf_error: Option<String>,
+    /// Показывать HF-токен в открытом виде.
+    pub hf_show_token: bool,
     /// Текущее скачивание файла модели, если идёт.
-    model_download: Option<ModelDownload>,
+    pub model_download: Option<ModelDownload>,
     /// Файл модели, ожидающий подтверждения удаления (второй щелчок).
-    model_delete_armed: Option<PathBuf>,
+    pub model_delete_armed: Option<PathBuf>,
     /// Кэш прочитанного GGUF-заголовка для текущего пути модели.
-    model_info_cache: Option<(PathBuf, Option<gguf::GgufInfo>)>,
+    pub model_info_cache: Option<(PathBuf, Option<gguf::GgufInfo>)>,
+    /// Кэш GGUF-заголовков для таблицы библиотеки моделей.
+    pub gguf_cache: HashMap<PathBuf, Option<gguf::GgufInfo>>,
     /// Fresh catalog fetched in the background, picked up on the next frame.
-    catalog_refresh: std::sync::Arc<std::sync::Mutex<Option<ParamsCatalog>>>,
+    pub catalog_refresh: std::sync::Arc<std::sync::Mutex<Option<ParamsCatalog>>>,
 }
 
 /// Message from the background model file download thread.
-enum ModelDownloadMsg {
+pub(crate) enum ModelDownloadMsg {
     Progress(u64, u64),
     Done(Result<(), String>),
 }
 
 /// Состояние скачивания одного файла GGUF-модели.
-struct ModelDownload {
-    repo: String,
-    path: String,
-    downloaded: u64,
-    total: u64,
-    rx: mpsc::Receiver<ModelDownloadMsg>,
-    error: Option<String>,
+pub struct ModelDownload {
+    pub repo: String,
+    pub path: String,
+    pub downloaded: u64,
+    pub total: u64,
+    pub rx: mpsc::Receiver<ModelDownloadMsg>,
+    pub error: Option<String>,
 }
 
 /// Message from the background build download thread.
-enum BuildDownloadMsg {
+pub(crate) enum BuildDownloadMsg {
     Progress(builds::Progress),
     Done(Result<(), String>),
 }
 
 /// Состояние скачивания и установки одной сборки llama.cpp.
-struct BuildDownload {
-    asset: github::BuildAsset,
-    downloaded: u64,
-    total: u64,
-    extracting: bool,
-    rx: mpsc::Receiver<BuildDownloadMsg>,
+pub struct BuildDownload {
+    pub asset: github::BuildAsset,
+    pub downloaded: u64,
+    pub total: u64,
+    pub extracting: bool,
+    pub rx: mpsc::Receiver<BuildDownloadMsg>,
     /// Результат при ошибке (при успехе скачивание убирается сразу —
     /// сборка появляется в списке «Установленные сборки»).
-    error: Option<String>,
+    pub error: Option<String>,
 }
 
-/// Editable server launch parameters (will become presets in a later stage).
+/// Editable server launch parameters.
 #[derive(Clone, Debug)]
-struct ServerForm {
-    binary: PathBuf,
-    model: PathBuf,
-    host: String,
-    port: u16,
-    extra_args: String,
-    last_error: Option<String>,
+pub struct ServerForm {
+    pub binary: PathBuf,
+    pub model: PathBuf,
+    pub host: String,
+    pub port: u16,
+    pub extra_args: String,
+    pub last_error: Option<String>,
 }
 
 impl Default for ServerForm {
@@ -171,7 +191,7 @@ impl Default for ServerForm {
 }
 
 impl ServerForm {
-    fn to_config(&self, extra_args: Vec<String>) -> ServerConfig {
+    pub fn to_config(&self, extra_args: Vec<String>) -> ServerConfig {
         ServerConfig {
             binary: self.binary.clone(),
             model: self.model.clone(),
@@ -261,11 +281,13 @@ impl App {
             preset_name_edit: String::new(),
             preset_delete_armed: false,
             preset_msg: None,
+            params_tab: 0,
+            log_filter: [true; 4],
             build_releases: None,
             build_releases_rx: None,
             build_releases_loading: false,
             build_releases_error: None,
-            build_filter: String::new(),
+            build_backend_filter: None,
             build_show_all: false,
             build_download: None,
             build_delete_armed: None,
@@ -277,9 +299,11 @@ impl App {
             hf_files: Vec::new(),
             hf_files_rx: None,
             hf_error: None,
+            hf_show_token: false,
             model_download: None,
             model_delete_armed: None,
             model_info_cache: None,
+            gguf_cache: HashMap::new(),
             catalog_refresh,
             settings,
             applied_theme: None,
@@ -311,12 +335,12 @@ impl App {
         }
     }
 
-    fn mark_dirty(&mut self) {
+    pub(crate) fn mark_dirty(&mut self) {
         self.config_dirty = true;
         self.last_change = Some(Instant::now());
     }
 
-    fn save_settings(&mut self) {
+    pub(crate) fn save_settings(&mut self) {
         match config::save(&self.settings) {
             Ok(()) => {
                 self.config_dirty = false;
@@ -327,15 +351,20 @@ impl App {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Шелл: боковая панель и каркас страницы
+    // -----------------------------------------------------------------------
+
     fn nav_panel(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(10.0);
+        ui.add_space(12.0);
 
         ui.horizontal(|ui| {
             if !self.sidebar_collapsed {
-                ui.heading(
-                    RichText::new("LlamaCpp Manager")
-                        .color(theme::ACCENT)
-                        .size(18.0),
+                ui.label(
+                    egui::RichText::new("LlamaCpp Manager")
+                        .size(15.0)
+                        .strong()
+                        .color(theme::ACCENT),
                 );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -357,51 +386,52 @@ impl App {
         });
 
         if !self.sidebar_collapsed {
-            ui.small("локальный менеджер llama-server");
+            ui.label(
+                egui::RichText::new("локальный менеджер llama-server")
+                    .size(11.0)
+                    .color(crate::theme::MUTED),
+            );
         }
         ui.add_space(16.0);
 
         for page in Page::ALL {
             let selected = self.page == page;
             let response = if self.sidebar_collapsed {
-                let icon = RichText::new(page.icon()).size(17.0);
-                ui.add_sized(
-                    [ui.available_width(), 34.0],
-                    egui::Button::new(icon).selected(selected),
-                )
+                let button = egui::Button::new(egui::RichText::new(page.icon()).size(15.0))
+                    .selected(selected)
+                    .min_size(egui::vec2(ui.available_width(), 32.0));
+                ui.add(button).on_hover_text(page.title())
             } else {
-                ui.selectable_label(selected, RichText::new(page.label()).size(15.0))
+                ui::nav_item(ui, selected, page.icon(), page.label())
             };
             if response.clicked() {
                 self.page = page;
             }
-            if self.sidebar_collapsed {
-                response.on_hover_text(page.title());
+            if !self.sidebar_collapsed {
+                ui.add_space(2.0);
             }
-            ui.add_space(2.0);
         }
 
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
             ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(4.0);
             self.sidebar_server_block(ui);
         });
     }
 
-    /// Persistent server status and control buttons at the bottom of the
-    /// sidebar, so they are reachable from any page without scrolling.
+    /// Карточка статуса сервера внизу сайдбара: индикатор + порт +
+    /// кнопки Start/Stop/Restart, доступные с любого экрана.
     fn sidebar_server_block(&mut self, ui: &mut egui::Ui) {
         let collapsed = self.sidebar_collapsed;
         let state = self.server.state();
-        let (color, hint) = state_status(state);
+        let (color, hint) = ui::state_status(state);
         let running = self.server.is_running();
         let has_config = self.server.config().is_some();
+        let port = self.server_form.port;
 
         if collapsed {
             ui.add_sized(
                 [ui.available_width(), 20.0],
-                egui::Label::new(RichText::new("●").color(color).size(16.0)),
+                egui::Label::new(egui::RichText::new("●").color(color).size(16.0)),
             )
             .on_hover_text(format!("Сервер: {}", state.label()));
             for (icon, tooltip, enabled, action) in [
@@ -412,7 +442,7 @@ impl App {
                 let button = if enabled {
                     egui::Button::new(icon)
                 } else {
-                    egui::Button::new(RichText::new(icon).weak())
+                    egui::Button::new(egui::RichText::new(icon).weak())
                 };
                 let clicked = ui
                     .add_sized([ui.available_width(), 24.0], button)
@@ -427,206 +457,108 @@ impl App {
                 }
             }
         } else {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("●").color(color).size(16.0))
-                    .on_hover_text(hint);
-                ui.label(RichText::new(state.label()).strong());
-            });
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(!running, egui::Button::new("▶"))
-                    .on_hover_text("Запустить сервер")
-                    .clicked()
-                {
-                    self.try_start_server();
-                }
-                if ui
-                    .add_enabled(running, egui::Button::new("■"))
-                    .on_hover_text("Остановить сервер")
-                    .clicked()
-                {
-                    self.server.stop();
-                }
-                if ui
-                    .add_enabled(has_config, egui::Button::new("↻"))
-                    .on_hover_text("Перезапустить сервер")
-                    .clicked()
-                {
-                    self.try_restart_server();
-                }
+            ui::card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui::status_dot(ui, color, 4.0);
+                    ui.label(egui::RichText::new(state.label()).size(13.0).strong());
+                });
+                ui.label(
+                    egui::RichText::new(format!("порт {port}"))
+                        .size(11.0)
+                        .color(crate::theme::MUTED),
+                )
+                .on_hover_text(hint);
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.style_mut().spacing.item_spacing.x = 6.0;
+                    if ui
+                        .add_enabled(!running, egui::Button::new("▶ Запустить").small())
+                        .on_hover_text("Запустить сервер")
+                        .clicked()
+                    {
+                        self.try_start_server();
+                    }
+                    if ui
+                        .add_enabled(running, egui::Button::new("■ Остановить").small())
+                        .on_hover_text("Остановить сервер")
+                        .clicked()
+                    {
+                        self.server.stop();
+                    }
+                    if ui
+                        .add_enabled(has_config, egui::Button::new("↻").small())
+                        .on_hover_text("Перезапустить сервер")
+                        .clicked()
+                    {
+                        self.try_restart_server();
+                    }
+                });
                 if let Some(error) = self.server_form.last_error.as_ref() {
-                    ui.label(RichText::new(error).small().color(theme::ERR_RED))
-                        .on_hover_text(error);
+                    ui.label(
+                        egui::RichText::new(error)
+                            .size(11.0)
+                            .color(crate::theme::ERR_RED),
+                    )
+                    .on_hover_text(error);
                 }
             });
         }
     }
 
     fn page_content(&mut self, ui: &mut egui::Ui) {
-        ui.heading(self.page.title());
+        ui.add_space(4.0);
+        ui::screen_header(ui, self.page.title(), self.page.subtitle());
         ui.add_space(8.0);
         match self.page {
-            Page::Server => self.server_page(ui),
-            Page::Models => self.models_page(ui),
-            Page::Builds => self.builds_page(ui),
-            Page::Settings => self.settings_page(ui),
+            Page::Server => ui::server::show(self, ui),
+            Page::Models => ui::models::show(self, ui),
+            Page::Builds => ui::builds::show(self, ui),
+            Page::Settings => ui::settings::show(self, ui),
         }
+        ui.add_space(16.0);
     }
 
-    fn server_page(&mut self, ui: &mut egui::Ui) {
-        self.server_status_bar(ui);
-        ui.add_space(8.0);
-        self.presets_section(ui);
-        ui.add_space(12.0);
-        self.server_config_section(ui);
-        ui.add_space(12.0);
-        self.server_log_panel(ui);
-        ui.add_space(12.0);
-        self.app_log_panel(ui);
-    }
+    // -----------------------------------------------------------------------
+    // Пресеты
+    // -----------------------------------------------------------------------
 
-    /// Preset management: load, save-as, rename, delete, import/export.
-    /// While a preset is selected, any configuration change is auto-saved
-    /// into it (see the debounce block in `ui`).
-    fn presets_section(&mut self, ui: &mut egui::Ui) {
-        ui.heading(RichText::new("Пресеты").size(16.0));
-        let names = self.presets.list();
-        // Forget a selection that no longer exists on disk.
-        if let Some(sel) = self.selected_preset.as_ref()
-            && !names.contains(sel)
+    /// Синхронизация выбора пресета: при смене выделения мгновенно загружает
+    /// пресет в форму (до дебаунс-автосохранения, чтобы не затереть его
+    /// текущим состоянием формы). Вызывается из тулбара пресетов.
+    pub fn sync_preset_selection(&mut self) {
+        if self.selected_preset == self.mirrored_preset {
+            return;
+        }
+        // Flush pending auto-save of the preset being switched away from,
+        // so edits made less than a debounce ago are not lost.
+        if self.config_dirty
+            && let Some(previous) = self.mirrored_preset.clone()
+            && let Err(e) = self.presets.save(&self.current_preset(previous.clone()))
         {
-            self.selected_preset = None;
-            self.preset_delete_armed = false;
+            self.set_preset_msg(true, format!("Не удалось автосохранить пресет: {e:#}"));
         }
-        // When the selection changes: remember it and load the preset right
-        // away, so the form always mirrors the selected preset. Otherwise the
-        // debounced auto-save would write the current form state into the
-        // preset that was just picked, destroying its contents.
-        if self.selected_preset != self.mirrored_preset {
-            // Flush pending auto-save of the preset being switched away from,
-            // so edits made less than a debounce ago are not lost.
-            if self.config_dirty
-                && let Some(previous) = self.mirrored_preset.clone()
-                && let Err(e) = self.presets.save(&self.current_preset(previous.clone()))
-            {
-                self.set_preset_msg(true, format!("Не удалось автосохранить пресет: {e:#}"));
-            }
-            self.mirrored_preset = self.selected_preset.clone();
-            self.preset_name_edit = self.selected_preset.clone().unwrap_or_default();
-            self.preset_delete_armed = false;
-            self.settings.last_preset = self.selected_preset.clone();
-            self.mark_dirty();
-            if let Some(name) = self.selected_preset.clone() {
-                match self.presets.load(&name) {
-                    Ok(preset) => {
-                        self.apply_preset(preset);
-                        self.set_preset_msg(false, format!("Пресет «{name}» применён"));
-                    }
-                    Err(e) => {
-                        self.selected_preset = None;
-                        self.mirrored_preset = None;
-                        self.preset_name_edit.clear();
-                        self.set_preset_msg(true, format!("Не удалось загрузить пресет: {e:#}"));
-                    }
+        self.mirrored_preset = self.selected_preset.clone();
+        self.preset_name_edit = self.selected_preset.clone().unwrap_or_default();
+        self.preset_delete_armed = false;
+        self.settings.last_preset = self.selected_preset.clone();
+        self.mark_dirty();
+        if let Some(name) = self.selected_preset.clone() {
+            match self.presets.load(&name) {
+                Ok(preset) => {
+                    self.apply_preset(preset);
+                    self.set_preset_msg(false, format!("Пресет «{name}» применён"));
+                }
+                Err(e) => {
+                    self.selected_preset = None;
+                    self.mirrored_preset = None;
+                    self.preset_name_edit.clear();
+                    self.set_preset_msg(true, format!("Не удалось загрузить пресет: {e:#}"));
                 }
             }
-        }
-        let selection = self.selected_preset.clone();
-        let has_selection = selection.is_some();
-        let typed_name = self.preset_name_edit.trim().to_string();
-
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            let label = selection.clone().unwrap_or_else(|| "— выберите пресет —".into());
-            egui::ComboBox::from_id_salt("preset-select")
-                .selected_text(label)
-                .width(240.0)
-                .show_ui(ui, |ui| {
-                    for name in &names {
-                        ui.selectable_value(&mut self.selected_preset, Some(name.clone()), name.clone());
-                    }
-                });
-            if ui
-                .add_enabled(has_selection, egui::Button::new("Загрузить"))
-                .on_hover_text("Применить пресет заново (отменить правки, ещё не сохранённые в пресет)")
-                .clicked()
-            {
-                self.preset_delete_armed = false;
-                self.load_selected_preset();
-            }
-            let delete_label = if self.preset_delete_armed { "Точно удалить?" } else { "Удалить" };
-            if ui
-                .add_enabled(has_selection, egui::Button::new(delete_label))
-                .on_hover_text("Второй щелчок подтверждает удаление")
-                .clicked()
-            {
-                if self.preset_delete_armed {
-                    self.delete_selected_preset();
-                    self.preset_delete_armed = false;
-                } else {
-                    self.preset_delete_armed = true;
-                }
-            }
-        });
-
-        ui.horizontal(|ui| {
-            ui.add_sized([LABEL_WIDTH, 18.0], egui::Label::new("Имя пресета"));
-            ui.add(
-                egui::TextEdit::singleline(&mut self.preset_name_edit)
-                    .desired_width(240.0)
-                    .hint_text("например: gemma-mtp-локально"),
-            );
-            if ui
-                .add_enabled(
-                    !typed_name.is_empty(),
-                    egui::Button::new("Сохранить как новый"),
-                )
-                .on_hover_text("Сохранить текущую конфигурацию и параметры под введённым именем")
-                .clicked()
-            {
-                self.save_current_as_preset();
-            }
-            let name_differs = has_selection && selection.as_deref() != Some(typed_name.as_str());
-            if ui
-                .add_enabled(
-                    name_differs,
-                    egui::Button::new("Переименовать"),
-                )
-                .on_hover_text(format!(
-                    "Переименовать «{}» в «{typed_name}»",
-                    selection.as_deref().unwrap_or("")
-                ))
-                .clicked()
-            {
-                self.preset_delete_armed = false;
-                self.rename_selected_preset();
-            }
-            if ui.button("Экспорт…").clicked() {
-                self.export_selected_preset();
-            }
-            if ui.button("Импорт…").clicked() {
-                self.import_preset_file();
-            }
-        });
-
-        if has_selection {
-            ui.label(
-                RichText::new(format!(
-                    "Изменения конфигурации и параметров автоматически сохраняются в пресет «{}».",
-                    selection.unwrap()
-                ))
-                .small()
-                .weak(),
-            );
-        }
-        if let Some((is_error, message)) = &self.preset_msg {
-            let color = if *is_error { theme::ERR_RED } else { theme::OK_GREEN };
-            ui.label(RichText::new(message).color(color).small());
         }
     }
 
-    fn set_preset_msg(&mut self, is_error: bool, message: String) {
+    pub fn set_preset_msg(&mut self, is_error: bool, message: String) {
         if is_error {
             log::error!("Пресеты: {message}");
         } else {
@@ -636,7 +568,7 @@ impl App {
     }
 
     /// Snapshot of the current form + parameters as a preset.
-    fn current_preset(&self, name: String) -> Preset {
+    pub fn current_preset(&self, name: String) -> Preset {
         Preset {
             name,
             binary: self.server_form.binary.clone(),
@@ -660,20 +592,20 @@ impl App {
         self.mark_dirty();
     }
 
-    fn load_selected_preset(&mut self) {
+
+    /// Сохранить текущую конфигурацию в выбранный пресет.
+    pub fn save_into_selected_preset(&mut self) {
         let Some(name) = self.selected_preset.clone() else {
             return;
         };
-        match self.presets.load(&name) {
-            Ok(preset) => {
-                self.apply_preset(preset);
-                self.set_preset_msg(false, format!("Пресет «{name}» загружен"));
-            }
-            Err(e) => self.set_preset_msg(true, format!("Не удалось загрузить пресет: {e:#}")),
+        let preset = self.current_preset(name.clone());
+        match self.presets.save(&preset) {
+            Ok(()) => self.set_preset_msg(false, format!("Пресет «{name}» сохранён")),
+            Err(e) => self.set_preset_msg(true, format!("Не удалось сохранить пресет: {e:#}")),
         }
     }
 
-    fn save_current_as_preset(&mut self) {
+    pub fn save_current_as_preset(&mut self) {
         let name = self.preset_name_edit.trim().to_string();
         let preset = self.current_preset(name.clone());
         match self.presets.save(&preset) {
@@ -686,7 +618,7 @@ impl App {
         }
     }
 
-    fn rename_selected_preset(&mut self) {
+    pub fn rename_selected_preset(&mut self) {
         let new_name = self.preset_name_edit.trim().to_string();
         let Some(old_name) = self.selected_preset.clone() else {
             return;
@@ -699,18 +631,26 @@ impl App {
             p.name = new_name.clone();
             p
         }) {
-            Ok(renamed) => match self.presets.save(&renamed).and_then(|()| self.presets.delete(&old_name)) {
-                Ok(()) => {
-                    self.selected_preset = Some(new_name.clone());
-                    self.set_preset_msg(false, format!("«{old_name}» переименован в «{new_name}»"));
+            Ok(renamed) => {
+                match self
+                    .presets
+                    .save(&renamed)
+                    .and_then(|()| self.presets.delete(&old_name))
+                {
+                    Ok(()) => {
+                        self.selected_preset = Some(new_name.clone());
+                        self.set_preset_msg(false, format!("«{old_name}» переименован в «{new_name}»"));
+                    }
+                    Err(e) => {
+                        self.set_preset_msg(true, format!("Не удалось переименовать пресет: {e:#}"))
+                    }
                 }
-                Err(e) => self.set_preset_msg(true, format!("Не удалось переименовать пресет: {e:#}")),
-            },
+            }
             Err(e) => self.set_preset_msg(true, format!("Не удалось переименовать пресет: {e:#}")),
         }
     }
 
-    fn delete_selected_preset(&mut self) {
+    pub fn delete_selected_preset(&mut self) {
         let Some(name) = self.selected_preset.clone() else {
             return;
         };
@@ -723,7 +663,7 @@ impl App {
         }
     }
 
-    fn export_selected_preset(&mut self) {
+    pub fn export_selected_preset(&mut self) {
         let Some(name) = self.selected_preset.clone() else {
             self.set_preset_msg(true, "Сначала выберите пресет для экспорта".into());
             return;
@@ -737,8 +677,12 @@ impl App {
                     .add_filter("JSON-пресет", &["json"]);
                 if let Some(path) = dialog.save_file() {
                     match presets::export_to(&preset, &path) {
-                        Ok(()) => self.set_preset_msg(false, format!("Пресет экспортирован: {}", path.display())),
-                        Err(e) => self.set_preset_msg(true, format!("Не удалось экспортировать пресет: {e:#}")),
+                        Ok(()) => {
+                            self.set_preset_msg(false, format!("Пресет экспортирован: {}", path.display()))
+                        }
+                        Err(e) => {
+                            self.set_preset_msg(true, format!("Не удалось экспортировать пресет: {e:#}"))
+                        }
                     }
                 }
             }
@@ -746,7 +690,7 @@ impl App {
         }
     }
 
-    fn import_preset_file(&mut self) {
+    pub fn import_preset_file(&mut self) {
         // The dialog must be created and awaited only on click —
         // pick_file is a blocking call.
         let dialog = rfd::FileDialog::new()
@@ -767,13 +711,19 @@ impl App {
                             self.preset_delete_armed = false;
                             self.set_preset_msg(false, format!("Пресет «{name}» импортирован"));
                         }
-                        Err(e) => self.set_preset_msg(true, format!("Не удалось импортировать пресет: {e:#}")),
+                        Err(e) => {
+                            self.set_preset_msg(true, format!("Не удалось импортировать пресет: {e:#}"))
+                        }
                     }
                 }
                 Err(e) => self.set_preset_msg(true, format!("Не удалось импортировать пресет: {e:#}")),
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Запуск сервера
+    // -----------------------------------------------------------------------
 
     /// Pre-start checks shown to the user before spawning the process.
     /// Returns Err with a human-readable summary when it is not OK to proceed.
@@ -797,36 +747,7 @@ impl App {
         }
     }
 
-    fn server_status_bar(&mut self, ui: &mut egui::Ui) {
-        let state = self.server.state();
-        let (color, hint) = state_status(state);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("●").color(color).size(18.0));
-            ui.label(RichText::new(state.label()).size(16.0).strong());
-            ui.label(RichText::new(hint).weak().small());
-        });
-        if state == ServerState::Ready {
-            ui.horizontal(|ui| {
-                let url = format!(
-                    "http://{}:{}",
-                    self.server_form.host.trim(),
-                    self.server_form.port
-                );
-                ui.label(RichText::new(&url).monospace());
-                if ui.small_button("Копировать адрес API").clicked() {
-                    ui.ctx().copy_text(url.clone());
-                }
-                if ui.small_button("Открыть в браузере").clicked() {
-                    open_url(&url);
-                }
-            });
-        }
-        if let Some(error) = &self.server_form.last_error {
-            ui.label(RichText::new(error).color(theme::ERR_RED).small());
-        }
-    }
-
-    fn try_start_server(&mut self) {
+    pub fn try_start_server(&mut self) {
         self.server_form.last_error = None;
         let config = self.server_form.to_config(self.build_extra_args());
         if let Err(e) = self
@@ -838,7 +759,7 @@ impl App {
         }
     }
 
-    fn try_restart_server(&mut self) {
+    pub fn try_restart_server(&mut self) {
         self.server_form.last_error = None;
         if let Err(e) = self.server.restart() {
             log::error!("Перезапуск не удался: {e}");
@@ -846,7 +767,7 @@ impl App {
         }
     }
 
-    fn build_extra_args(&self) -> Vec<String> {
+    pub fn build_extra_args(&self) -> Vec<String> {
         let mut args = params::to_args(&self.params_catalog, &self.settings.params);
         if let Some(raw) = shlex::split(&self.server_form.extra_args) {
             args.extend(raw);
@@ -854,162 +775,8 @@ impl App {
         args
     }
 
-    /// Parameter catalog UI grouped by category.
-    fn params_section(&mut self, ui: &mut egui::Ui) {
-        ui.heading(RichText::new("Параметры llama-server").size(16.0));
-        // Sections with draft/MTP and GPU settings are open by default —
-        // they are the most-used knobs for this app's audience.
-        let mut params_changed = false;
-        for (cat_id, cat_label) in self.params_catalog.categories() {
-            let defs: Vec<&ParamDef> = self
-                .params_catalog
-                .params
-                .iter()
-                .filter(|p| p.category == cat_id)
-                .collect();
-            if defs.is_empty() {
-                continue;
-            }
-            let default_open = matches!(cat_id, "context" | "gpu" | "spec");
-            egui::CollapsingHeader::new(RichText::new(cat_label).size(14.0))
-                .default_open(default_open)
-                .show(ui, |ui| {
-                    for def in defs {
-                        params_changed |= param_row(ui, def, &mut self.settings.params);
-                    }
-                });
-        }
-        if params_changed {
-            self.mark_dirty();
-        }
-        ui.add_space(4.0);
-    }
-
-    fn server_config_section(&mut self, ui: &mut egui::Ui) {
-        ui.heading(RichText::new("Конфигурация").size(16.0));
-        let mut form_changed = false;
-        {
-            let form = &mut self.server_form;
-            form_changed |= path_row(ui, "Бинарник llama-server", &mut form.binary, "путь к llama-server", PathPick::File);
-            form_changed |= path_row(ui, "Файл модели", &mut form.model, "путь к GGUF-файлу модели", PathPick::File);
-
-            ui.horizontal(|ui| {
-                ui.add_sized([LABEL_WIDTH, 18.0], egui::Label::new("Host"));
-                form_changed |= ui
-                    .add(
-                        egui::TextEdit::singleline(&mut form.host)
-                            .desired_width(220.0)
-                            .hint_text("127.0.0.1"),
-                    )
-                    .changed();
-                ui.label("Порт");
-                form_changed |= ui
-                    .add(
-                        egui::DragValue::new(&mut form.port)
-                            .range(1..=65535)
-                            .custom_formatter(|v, _| format!("{}", v as u16))
-                            .custom_parser(|s| s.parse::<u16>().ok().map(f64::from)),
-                    )
-                    .changed();
-            });
-        }
-        self.memory_estimate_section(ui);
-
-        if self.server_form.host.trim() == "0.0.0.0" {
-            ui.label(
-                RichText::new("⚠ Host 0.0.0.0 делает сервер доступным из сети. Убедитесь, что это безопасно.")
-                    .small()
-                    .color(theme::WARN_YELLOW),
-            );
-        }
-
-        ui.add_space(4.0);
-        self.params_section(ui);
-
-        ui.add_space(4.0);
-        ui.label("Сырые аргументы (сверх каталога)").on_hover_text("Разделяйте пробелом; кавычки поддерживаются. Для флагов, которых нет в каталоге.");
-        form_changed |= ui
-            .add(
-                egui::TextEdit::multiline(&mut self.server_form.extra_args)
-                    .desired_rows(2)
-                    .desired_width(ui.available_width())
-                    .code_editor(),
-            )
-            .changed();
-        if form_changed {
-            self.mark_dirty();
-        }
-
-        // Parameter validation warnings.
-        let problems = params::validate(&self.params_catalog, &self.settings.params);
-        if !problems.is_empty() {
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new(format!(
-                    "⚠ Проверка параметров:\n{}",
-                    problems.iter().map(|p| format!("• {p}")).collect::<Vec<_>>().join("\n")
-                ))
-                .small()
-                .color(theme::WARN_YELLOW),
-            );
-        }
-
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(format!(
-                "Команда запуска:\n{}",
-                self.server_form.to_config(self.build_extra_args()).command_line()
-            ))
-            .monospace()
-            .small(),
-        );
-    }
-
-    fn server_log_panel(&mut self, ui: &mut egui::Ui) {
-        ui.collapsing(RichText::new("📜 Журнал llama-server").size(15.0), |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("Сохранить лог в файл…").clicked() {
-                    self.save_server_log();
-                }
-                if ui.button("Очистить").clicked()
-                    && let Ok(mut log) = self.server.server_log().lock()
-                {
-                    log.clear();
-                }
-            });
-            ui.add_space(4.0);
-            let lines: Vec<(chrono::DateTime<chrono::Local>, String)> = self
-                .server
-                .server_log()
-                .lock()
-                .map(|log| log.lines().to_vec())
-                .unwrap_or_default();
-            ScrollArea::vertical()
-                .id_salt("server_log")
-                .stick_to_bottom(true)
-                .max_height(320.0)
-                .show(ui, |ui| {
-                    egui::Frame::default()
-                        .fill(ui.visuals().extreme_bg_color)
-                        .inner_margin(6.0)
-                        .corner_radius(6.0)
-                        .show(ui, |ui| {
-                            if lines.is_empty() {
-                                ui.weak("нет вывода процесса");
-                            }
-                            for (time, line) in lines {
-                                ui.label(
-                                    RichText::new(format!("{} {}", time.format("%H:%M:%S"), line))
-                                        .monospace()
-                                        .size(12.0),
-                                );
-                            }
-                        });
-                });
-        });
-    }
-
-    fn save_server_log(&mut self) {
+    /// Сохранить журнал llama-server в файл через диалог.
+    pub fn save_server_log(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .set_file_name("llama-server.log")
             .save_file()
@@ -1032,328 +799,30 @@ impl App {
         }
     }
 
-    fn app_log_panel(&mut self, ui: &mut egui::Ui) {
-        let Some(handle) = self.log_handle.clone() else {
-            return;
-        };
-        ui.collapsing(RichText::new("📜 Журнал приложения").size(15.0), |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("Очистить").clicked() {
-                    handle.clear();
-                }
-                if ui.button("Открыть папку логов").clicked() {
-                    open_folder(&self.settings.logs_dir);
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let mut debug = self.settings.debug_logging;
-                    if ui
-                        .checkbox(&mut debug, "Debug")
-                        .on_hover_text("Подробные debug-сообщения (настраивается и на экране настроек)")
-                        .changed()
-                    {
-                        self.settings.debug_logging = debug;
-                        if let Some(handle) = &self.log_handle {
-                            handle.set_debug(debug);
-                        }
-                        self.mark_dirty();
-                    }
-                });
-            });
-            ui.add_space(4.0);
+    // -----------------------------------------------------------------------
+    // Модели: поиск, скачивание, библиотека
+    // -----------------------------------------------------------------------
 
-            let entries: Vec<LogEntry> = handle.snapshot();
-            ScrollArea::vertical()
-                .id_salt("app_log")
-                .stick_to_bottom(true)
-                .max_height(220.0)
-                .show(ui, |ui| {
-                    egui::Frame::default()
-                        .fill(ui.visuals().extreme_bg_color)
-                        .inner_margin(6.0)
-                        .corner_radius(6.0)
-                        .show(ui, |ui| {
-                            if entries.is_empty() {
-                                ui.weak("журнал пуст");
-                            }
-                            for entry in entries {
-                                let color = level_color(entry.level);
-                                ui.label(
-                                    RichText::new(format!(
-                                        "{} {:<5} {}",
-                                        entry.time.format("%H:%M:%S"),
-                                        entry.level,
-                                        entry.message
-                                    ))
-                                    .monospace()
-                                    .size(12.0)
-                                    .color(color),
-                                );
-                            }
-                        });
-                });
-        });
+    /// GGUF-заголовок файла библиотеки (с кэшем по пути).
+    pub fn gguf_info_for(&mut self, path: &std::path::Path) -> Option<gguf::GgufInfo> {
+        if !self.gguf_cache.contains_key(path) {
+            let info = if path.is_file() {
+                match gguf::read_header(path) {
+                    Ok(info) => Some(info),
+                    Err(e) => {
+                        log::debug!("GGUF-заголовок {}: {e:#}", path.display());
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            self.gguf_cache.insert(path.to_path_buf(), info);
+        }
+        self.gguf_cache.get(path).cloned().flatten()
     }
 
-    fn models_page(&mut self, ui: &mut egui::Ui) {
-        self.poll_hf_search();
-        self.poll_hf_files();
-        self.poll_model_download();
-
-        // Библиотека — наверху, как «Установленные сборки» на странице «Сборки».
-        self.model_library_section(ui);
-        ui.add_space(12.0);
-
-        ui.heading(RichText::new("Поиск GGUF-моделей на HuggingFace").size(16.0));
-        ui.horizontal(|ui| {
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut self.hf_query)
-                    .desired_width(340.0)
-                    .hint_text("например: gemma 3n gguf"),
-            );
-            let enter_pressed =
-                response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if ui
-                .add_enabled(!self.hf_searching, egui::Button::new("Найти"))
-                .clicked()
-                || enter_pressed
-            {
-                self.start_hf_search();
-            }
-            if self.hf_searching {
-                ui.add(egui::Spinner::new().size(16.0));
-            }
-            if let Some(error) = &self.hf_error {
-                ui.label(RichText::new(error).small().color(theme::ERR_RED));
-            }
-        });
-        ui.add_space(8.0);
-
-        if let Some(results) = self.hf_results.clone() {
-            ui.label(RichText::new(format!("Найдено: {}", results.len())).weak());
-            ScrollArea::vertical()
-                .max_height(150.0)
-                .id_salt("hf-results")
-                .show(ui, |ui| {
-                    for model in &results {
-                        ui.horizontal(|ui| {
-                            let selected =
-                                self.hf_selected_repo.as_deref() == Some(model.id.as_str());
-                            let text = format!(
-                                "{}  —  загрузок: {}, звёзд: {}",
-                                model.id, model.downloads, model.likes
-                            );
-                            if ui
-                                .selectable_label(selected, text)
-                                .on_hover_text("Показать файлы модели")
-                                .clicked()
-                            {
-                                self.select_hf_repo(model.id.clone());
-                            }
-                        });
-                    }
-                });
-        }
-
-        if let Some(repo) = self.hf_selected_repo.clone() {
-            ui.add_space(12.0);
-            ui.heading(RichText::new(format!("Файлы {repo}")).size(16.0));
-            if self.hf_files_rx.is_some() {
-                ui.horizontal(|ui| {
-                    ui.add(egui::Spinner::new().size(14.0));
-                    ui.label("Получение списка файлов…");
-                });
-            }
-            let files = self.hf_files.clone();
-            let mut clear_download = false;
-            for file in &files {
-                let dest = self.settings.models_dir.join(&file.path);
-                let downloaded = dest.is_file();
-                ui.horizontal(|ui| {
-                    ui.label(&file.path);
-                    if let Some(quant) = huggingface::quant_from_filename(&file.path) {
-                        ui.label(RichText::new(quant).small().color(theme::ACCENT));
-                    }
-                    ui.label(RichText::new(format_size(file.size)).small().weak());
-                    if downloaded {
-                        ui.label(
-                            RichText::new("скачана")
-                                .small()
-                                .color(theme::OK_GREEN),
-                        );
-                    }
-                    // Прогресс — прямо в строке файла.
-                    if self.is_downloading_model(&file.path)
-                        && let Some(download) = self.model_download.as_ref()
-                    {
-                        let fraction = if download.total > 0 {
-                            download.downloaded as f32 / download.total as f32
-                        } else {
-                            0.0
-                        };
-                        ui.add(
-                            egui::ProgressBar::new(fraction)
-                                .show_percentage()
-                                .desired_width(160.0),
-                        );
-                        ui.label(
-                            RichText::new(format!(
-                                "{} из {}",
-                                format_size(download.downloaded),
-                                if download.total > 0 {
-                                    format_size(download.total)
-                                } else {
-                                    "?".into()
-                                }
-                            ))
-                            .small()
-                            .weak(),
-                        );
-                    } else if let Some(download) = self.model_download.as_ref()
-                        && download.error.is_some()
-                        && download.path == file.path
-                    {
-                        ui.label(
-                            RichText::new(download.error.clone().unwrap_or_default())
-                                .small()
-                                .color(theme::ERR_RED),
-                        );
-                        if ui.small_button("Скрыть").clicked() {
-                            clear_download = true;
-                        }
-                    } else if ui
-                        .add_enabled(
-                            self.model_download.is_none(),
-                            egui::Button::new(if downloaded { "Перекачать" } else { "Скачать" }),
-                        )
-                        .on_hover_text(format!(
-                            "{} в {}\n{}",
-                            if downloaded { "Скачать заново" } else { "Скачать" },
-                            self.settings.models_dir.display(),
-                            file.path
-                        ))
-                        .clicked()
-                    {
-                        self.start_model_download(repo.clone(), file.clone());
-                    }
-                });
-            }
-            if clear_download {
-                self.model_download = None;
-            }
-        }
-
-        ui.add_space(12.0);
-    }
-
-    /// Локальная библиотека моделей: gguf-файлы в models_dir (глубина 2).
-    fn model_library_section(&mut self, ui: &mut egui::Ui) {
-        ui.heading(RichText::new("Локальная библиотека моделей").size(16.0));
-        ui.label(
-            RichText::new(format!("Каталог: {}", self.settings.models_dir.display())).weak(),
-        );
-        let models = library_models(&self.settings.models_dir);
-        if models.is_empty() {
-            ui.label(
-                RichText::new("Пока нет скачанных моделей — найдите и скачайте выше, или укажите путь к .gguf вручную на странице «Сервер».").weak(),
-            );
-        }
-        for path in models {
-            ui.horizontal(|ui| {
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                let is_active = self.server_form.model == path;
-                let mut label = RichText::new(format!("{name} · {}", format_size(size)));
-                if is_active {
-                    label = label.color(theme::OK_GREEN).strong();
-                }
-                ui.label(label);
-                if ui
-                    .add_enabled(!is_active, egui::Button::new("Сделать моделью сервера"))
-                    .on_hover_text(path.display().to_string())
-                    .clicked()
-                {
-                    self.server_form.model = path.clone();
-                    self.mark_dirty();
-                    log::info!("Активная модель: {}", path.display());
-                }
-
-                let armed = self.model_delete_armed.as_deref() == Some(path.as_path());
-                let button_label = if armed { "Точно удалить?" } else { "Удалить" };
-                if ui
-                    .button(button_label)
-                    .on_hover_text(format!("Удалить файл с диска\n{}", path.display()))
-                    .clicked()
-                {
-                    if armed {
-                        self.delete_model_file(&path);
-                    } else {
-                        self.model_delete_armed = Some(path.clone());
-                    }
-                }
-                if armed {
-                    let affected = self.presets_using_model(&path);
-                    if !affected.is_empty() {
-                        ui.label(
-                            RichText::new(format!(
-                                "используется в пресетах: {} — их настройка модели станет нерабочей",
-                                affected.join(", ")
-                            ))
-                            .small()
-                            .color(theme::WARN_YELLOW),
-                        );
-                    }
-                }
-            });
-        }
-    }
-
-    /// Имена пресетов, использующих файл модели (как основную модель
-    /// или как Path-параметр: draft/mmproj и т.п.).
-    fn presets_using_model(&self, path: &std::path::Path) -> Vec<String> {
-        fn value_is_path(value: &serde_json::Value, path: &std::path::Path) -> bool {
-            value
-                .as_str()
-                .is_some_and(|s| std::path::Path::new(s) == path)
-        }
-        self.presets
-            .list()
-            .into_iter()
-            .filter(|name| {
-                self.presets.load(name).is_ok_and(|preset| {
-                    preset.model == path
-                        || preset
-                            .params
-                            .entries
-                            .values()
-                            .any(|entry| {
-                                entry
-                                    .value
-                                    .as_ref()
-                                    .is_some_and(|v| value_is_path(v, path))
-                            })
-                })
-            })
-            .collect()
-    }
-
-    /// Удалить файл модели с диска. Если он был активной моделью — сбросить.
-    fn delete_model_file(&mut self, path: &std::path::Path) {
-        if self.server_form.model == path {
-            self.server_form.model = PathBuf::new();
-            self.mark_dirty();
-            log::warn!("Удалённая модель была активной — файл модели сброшен, укажите другой");
-        }
-        match std::fs::remove_file(path) {
-            Ok(()) => log::info!("Модель удалена: {}", path.display()),
-            Err(e) => log::error!("Не удалось удалить {}: {e:#}", path.display()),
-        }
-    }
-
-    fn is_downloading_model(&self, path: &str) -> bool {
+    pub fn is_downloading_model(&self, path: &str) -> bool {
         self.model_download
             .as_ref()
             .is_some_and(|download| download.path == path)
@@ -1368,7 +837,7 @@ impl App {
         }
     }
 
-    fn start_hf_search(&mut self) {
+    pub fn start_hf_search(&mut self) {
         if self.hf_searching {
             return;
         }
@@ -1391,7 +860,7 @@ impl App {
         self.hf_search_rx = Some(rx);
     }
 
-    fn poll_hf_search(&mut self) {
+    pub fn poll_hf_search(&mut self) {
         let received = self.hf_search_rx.as_ref().map(|rx| rx.try_recv());
         match received {
             Some(Ok(Ok(models))) => {
@@ -1414,7 +883,7 @@ impl App {
         }
     }
 
-    fn select_hf_repo(&mut self, repo: String) {
+    pub fn select_hf_repo(&mut self, repo: String) {
         if self.hf_selected_repo.as_deref() == Some(repo.as_str()) {
             return;
         }
@@ -1433,7 +902,7 @@ impl App {
         self.hf_files_rx = Some(rx);
     }
 
-    fn poll_hf_files(&mut self) {
+    pub fn poll_hf_files(&mut self) {
         let received = self.hf_files_rx.as_ref().map(|rx| rx.try_recv());
         match received {
             Some(Ok(Ok(files))) => {
@@ -1453,7 +922,7 @@ impl App {
         }
     }
 
-    fn start_model_download(&mut self, repo: String, file: huggingface::HfFile) {
+    pub fn start_model_download(&mut self, repo: String, file: huggingface::HfFile) {
         if self.model_download.is_some() {
             return;
         }
@@ -1490,7 +959,7 @@ impl App {
 
     /// Подобрать сообщения из фонового потока скачивания модели.
     /// Успех убирает панель (файл появляется в библиотеке ниже).
-    fn poll_model_download(&mut self) {
+    pub fn poll_model_download(&mut self) {
         let mut succeeded = false;
         {
             let Some(download) = self.model_download.as_mut() else {
@@ -1530,227 +999,51 @@ impl App {
         }
     }
 
-    fn builds_page(&mut self, ui: &mut egui::Ui) {
-        self.poll_builds_refresh();
-        self.poll_build_download();
-        // Список релизов лениво подгружается при первом открытии страницы.
-        if self.build_releases.is_none()
-            && self.build_releases_rx.is_none()
-            && !self.build_releases_loading
-            && self.build_releases_error.is_none()
-        {
-            self.start_builds_refresh(false);
+    /// Удалить файл модели с диска. Если он был активной моделью — сбросить.
+    pub fn delete_model_file(&mut self, path: &std::path::Path) {
+        if self.server_form.model == path {
+            self.server_form.model = PathBuf::new();
+            self.mark_dirty();
+            log::warn!("Удалённая модель была активной — файл модели сброшен, укажите другой");
         }
-
-        ui.heading(RichText::new("Установленные сборки").size(16.0));
-        let store = builds::BuildsStore::new(self.settings.builds_dir.clone());
-        let installed = store.installed();
-        if installed.is_empty() {
-            ui.label(
-                RichText::new("Сборок пока нет. Скачайте релиз ниже — бинарник llama-server попадёт в библиотеку сборок.").weak(),
-            );
+        match std::fs::remove_file(path) {
+            Ok(()) => log::info!("Модель удалена: {}", path.display()),
+            Err(e) => log::error!("Не удалось удалить {}: {e:#}", path.display()),
         }
-        for build in &installed {
-            ui.horizontal(|ui| {
-                let binary = build.server_binary();
-                let is_active = binary.as_ref() == Some(&self.server_form.binary);
-                let mut label = RichText::new(build.label());
-                if is_active {
-                    label = label.color(theme::OK_GREEN).strong();
-                }
-                ui.label(label);
-                if let Some(bin) = &binary {
-                    ui.label(RichText::new(bin.display().to_string()).small().weak());
-                } else {
-                    ui.label(RichText::new("llama-server не найден").small().color(theme::WARN_YELLOW));
-                }
-                if ui
-                    .add_enabled(
-                        binary.is_some() && !is_active,
-                        egui::Button::new("Сделать активной"),
-                    )
-                    .on_hover_text("Использовать llama-server из этой сборки при запуске")
-                    .clicked()
-                    && let Some(bin) = binary
-                {
-                    self.activate_build_binary(build.tag.clone(), bin);
-                }
-
-                let armed = self.build_delete_armed.as_deref() == Some(build.dir.as_path());
-                let button_label = if armed { "Точно удалить?" } else { "Удалить" };
-                if ui
-                    .button(button_label)
-                    .on_hover_text(format!("Удалить каталог сборки\n{}", build.dir.display()))
-                    .clicked()
-                {
-                    if armed {
-                        self.delete_build(build);
-                    } else {
-                        self.build_delete_armed = Some(build.dir.clone());
-                    }
-                }
-                // Предупреждение: на эту сборку ссылаются пресеты.
-                if armed {
-                    let affected = self.presets_using_dir(&build.dir);
-                    if !affected.is_empty() {
-                        ui.label(
-                            RichText::new(format!(
-                                "используется в пресетах: {} — их настройка бинарника станет нерабочей",
-                                affected.join(", ")
-                            ))
-                            .small()
-                            .color(theme::WARN_YELLOW),
-                        );
-                    }
-                }
-            });
-        }
-        ui.add_space(12.0);
-
-        ui.heading(RichText::new("Релизы llama.cpp").size(16.0));
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    !self.build_releases_loading,
-                    egui::Button::new("Обновить список"),
-                )
-                .clicked()
-            {
-                self.start_builds_refresh(true);
-            }
-            if self.build_releases_loading {
-                ui.add(egui::Spinner::new().size(16.0));
-                ui.label("Загрузка списка релизов…");
-            }
-            if let Some(error) = &self.build_releases_error {
-                ui.label(RichText::new(error).small().color(theme::ERR_RED));
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label("Фильтр:");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.build_filter)
-                    .desired_width(220.0)
-                    .hint_text("версия или бэкенд: b10690, vulkan…"),
-            );
-            if !self.build_filter.is_empty() && ui.small_button("×").clicked() {
-                self.build_filter.clear();
-            }
-            let toggle_label = if self.build_show_all {
-                "Показать 5 последних"
-            } else {
-                "Показать все релизы"
-            };
-            if ui.button(toggle_label).clicked() {
-                self.build_show_all = !self.build_show_all;
-            }
-            if !self.build_show_all {
-                let hidden = self.total_filtered_tags().saturating_sub(self.visible_release_count());
-                if hidden > 0 {
-                    ui.label(RichText::new(format!("ещё {hidden} релизов скрыто")).weak());
-                }
-            }
-        });
-        ui.add_space(4.0);
-        self.build_download_panel(ui);
-
-        let assets = self.visible_os_assets();
-        if assets.is_empty() && !self.build_releases_loading && self.build_releases_error.is_none()
-        {
-            ui.label(RichText::new(
-                "Для вашей платформы сборки не определились автоматически — выберите файл вручную в списке ниже.",
-            ).color(theme::WARN_YELLOW));
-        }
-        ScrollArea::vertical().show(ui, |ui| {
-            let mut last_tag = String::new();
-            for asset in &assets {
-                if asset.tag != last_tag {
-                    last_tag = asset.tag.clone();
-                    ui.add_space(6.0);
-                    ui.label(RichText::new(&asset.tag).strong());
-                }
-                ui.horizontal(|ui| {
-                    let already_installed = store.dir_for(asset).is_dir();
-                    let size = format_size(asset.asset.size);
-                    let text = format!("{} · {}", asset.backend.label(), size);
-                    let tooltip = if already_installed {
-                        format!(
-                            "{}\nУже установлена — нажатие скачает и заменит её заново",
-                            asset.asset.name
-                        )
-                    } else {
-                        format!(
-                            "{}\nСкачать и установить в библиотеку сборок",
-                            asset.asset.name
-                        )
-                    };
-                    if ui
-                        .add_enabled(
-                            !self.is_downloading(&asset.asset.name),
-                            egui::Button::new(text),
-                        )
-                        .on_hover_text(tooltip)
-                        .clicked()
-                    {
-                        self.start_build_download(asset.clone());
-                    }
-                    if already_installed {
-                        ui.label(
-                            RichText::new("установлена")
-                                .small()
-                                .color(theme::OK_GREEN),
-                        );
-                    }
-                });
-            }
-
-            let manual: Vec<_> = self
-                .manual_assets(&assets)
-                .into_iter()
-                .filter(|(tag, asset)| {
-                    let backend = github::classify_asset(&asset.name)
-                        .map(|kind| kind.backend)
-                        .unwrap_or(github::Backend::Other);
-                    self.asset_matches_filter(tag, &asset.name, backend)
-                })
-                .collect();
-            if !manual.is_empty() {
-                ui.add_space(8.0);
-                egui::CollapsingHeader::new(RichText::new(
-                    "Другие файлы релизов (выбор вручную)",
-                ))
-                .default_open(assets.is_empty())
-                .show(ui, |ui| {
-                    for (tag, asset) in manual {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(&asset.name).small());
-                            ui.label(RichText::new(format_size(asset.size)).small().weak());
-                            if ui
-                                .add_enabled(
-                                    !self.is_downloading(&asset.name),
-                                    egui::Button::new("Скачать"),
-                                )
-                                .on_hover_text(format!("Релиз {tag}\n{}", asset.browser_download_url))
-                                .clicked()
-                            {
-                                let kind = github::classify_asset(&asset.name);
-                                self.start_build_download(github::BuildAsset {
-                                    asset: asset.clone(),
-                                    tag,
-                                    os: kind.and_then(|k| k.os),
-                                    arch: kind.and_then(|k| k.arch),
-                                    backend: kind
-                                        .map(|k| k.backend)
-                                        .unwrap_or(github::Backend::Other),
-                                    runtime_asset: None,
-                                });
-                            }
-                        });
-                    }
-                });
-            }
-        });
     }
+
+    /// Имена пресетов, использующих файл модели (как основную модель
+    /// или как Path-параметр: draft/mmproj и т.п.).
+    pub fn presets_using_model(&self, path: &std::path::Path) -> Vec<String> {
+        fn value_is_path(value: &serde_json::Value, path: &std::path::Path) -> bool {
+            value
+                .as_str()
+                .is_some_and(|s| std::path::Path::new(s) == path)
+        }
+        self.presets
+            .list()
+            .into_iter()
+            .filter(|name| {
+                self.presets.load(name).is_ok_and(|preset| {
+                    preset.model == path
+                        || preset
+                            .params
+                            .entries
+                            .values()
+                            .any(|entry| {
+                                entry
+                                    .value
+                                    .as_ref()
+                                    .is_some_and(|v| value_is_path(v, path))
+                            })
+                })
+            })
+            .collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // Сборки llama.cpp
+    // -----------------------------------------------------------------------
 
     /// Ассеты релизов для текущей ОС и архитектуры (в порядке релизов).
     fn current_os_assets(&self) -> Vec<github::BuildAsset> {
@@ -1764,24 +1057,25 @@ impl App {
             .collect()
     }
 
-    /// Соответствует ли сборка фильтру (тег, имя файла или бэкенд).
-    fn asset_matches_filter(&self, tag: &str, asset_name: &str, backend: github::Backend) -> bool {
-        let filter = self.build_filter.trim().to_lowercase();
-        if filter.is_empty() {
-            return true;
+    /// Соответствует ли сборка фильтру (тег или бэкенд).
+    pub fn asset_matches_filter(&self, tag: &str, backend: github::Backend) -> bool {
+        match self.build_backend_filter {
+            Some(filter) => backend == filter,
+            None => {
+                // Фильтр «Все»: текстовый поиск по тегу оставлен для ручного
+                // списка файлов, где бэкенд может быть неопознан.
+                true || !tag.is_empty()
+            }
         }
-        tag.to_lowercase().contains(&filter)
-            || asset_name.to_lowercase().contains(&filter)
-            || backend.label().to_lowercase().contains(&filter)
     }
 
     /// Ассеты текущей платформы с учётом фильтра и лимита релизов
     /// (по умолчанию — только 5 последних версий).
-    fn visible_os_assets(&self) -> Vec<github::BuildAsset> {
+    pub(crate) fn visible_os_assets(&self) -> Vec<github::BuildAsset> {
         let filtered: Vec<_> = self
             .current_os_assets()
             .into_iter()
-            .filter(|asset| self.asset_matches_filter(&asset.tag, &asset.asset.name, asset.backend))
+            .filter(|asset| self.asset_matches_filter(&asset.tag, asset.backend))
             .collect();
         if self.build_show_all {
             return filtered;
@@ -1790,23 +1084,23 @@ impl App {
     }
 
     /// Сколько разных тегов осталось после фильтра (для подписи «ещё N»).
-    fn total_filtered_tags(&self) -> usize {
+    pub fn total_filtered_tags(&self) -> usize {
         self.current_os_assets()
             .iter()
-            .filter(|asset| self.asset_matches_filter(&asset.tag, &asset.asset.name, asset.backend))
+            .filter(|asset| self.asset_matches_filter(&asset.tag, asset.backend))
             .map(|asset| asset.tag.clone())
             .collect::<std::collections::BTreeSet<_>>()
             .len()
     }
 
-    fn visible_release_count(&self) -> usize {
+    pub fn visible_release_count(&self) -> usize {
         5
     }
 
     /// Прочие файлы релизов (другие ОС/архитектуры) для ручного выбора,
     /// когда автоматическая классификация ничего не подобрала или нужен
     /// нестандартный вариант.
-    fn manual_assets(&self, primary: &[github::BuildAsset]) -> Vec<(String, github::Asset)> {
+    pub fn manual_assets(&self, primary: &[github::BuildAsset]) -> Vec<(String, github::Asset)> {
         let mut out = Vec::new();
         for release in self.build_releases.as_deref().unwrap_or(&[]) {
             for asset in &release.assets {
@@ -1825,68 +1119,16 @@ impl App {
         out
     }
 
-    /// Панель прогресса текущего скачивания сборки; остаётся на экране
-    /// только при ошибке (при успехе сборка сразу появляется в списке
-    /// «Установленные сборки»).
-    fn build_download_panel(&mut self, ui: &mut egui::Ui) {
-        let mut clear_download = false;
-        if let Some(download) = self.build_download.as_mut() {
-            ui.group(|ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(&download.asset.asset.name).strong());
-                    if let Some(error) = &download.error {
-                        ui.label(RichText::new(error).color(theme::ERR_RED));
-                        if ui.small_button("Скрыть").clicked() {
-                            clear_download = true;
-                        }
-                    }
-                });
-                if download.error.is_none() {
-                    if download.extracting {
-                        ui.horizontal(|ui| {
-                            ui.add(egui::Spinner::new().size(14.0));
-                            ui.label("Распаковка архива…");
-                        });
-                    } else {
-                        let fraction = if download.total > 0 {
-                            download.downloaded as f32 / download.total as f32
-                        } else {
-                            0.0
-                        };
-                        ui.add(
-                            egui::ProgressBar::new(fraction)
-                                .show_percentage()
-                                .desired_width(ui.available_width()),
-                        );
-                        let total = if download.total > 0 {
-                            format_size(download.total)
-                        } else {
-                            "?".to_string()
-                        };
-                        ui.label(format!(
-                            "{} из {}",
-                            format_size(download.downloaded),
-                            total
-                        ));
-                    }
-                }
-            });
-        }
-        if clear_download {
-            self.build_download = None;
-        }
-    }
-
     /// Загружается ли сейчас указанный архив (кнопку этой сборки блокируем,
     /// остальные остаются доступны).
-    fn is_downloading(&self, asset_name: &str) -> bool {
+    pub fn is_downloading(&self, asset_name: &str) -> bool {
         self.build_download
             .as_ref()
             .is_some_and(|download| download.asset.asset.name == asset_name)
     }
 
     /// Запустить фоновую загрузку списка релизов (с кэшем на сутки).
-    fn start_builds_refresh(&mut self, force: bool) {
+    pub fn start_builds_refresh(&mut self, force: bool) {
         if self.build_releases_loading {
             return;
         }
@@ -1905,7 +1147,7 @@ impl App {
     }
 
     /// Подобрать результат фоновой загрузки списка релизов.
-    fn poll_builds_refresh(&mut self) {
+    pub fn poll_builds_refresh(&mut self) {
         let received = self.build_releases_rx.as_ref().map(|rx| rx.try_recv());
         match received {
             Some(Ok(Ok(releases))) => {
@@ -1930,7 +1172,7 @@ impl App {
     }
 
     /// Запустить скачивание и установку сборки в фоновом потоке.
-    fn start_build_download(&mut self, asset: github::BuildAsset) {
+    pub fn start_build_download(&mut self, asset: github::BuildAsset) {
         if self.build_download.is_some() {
             return;
         }
@@ -1963,7 +1205,7 @@ impl App {
 
     /// Подобрать сообщения из фонового потока скачивания сборки.
     /// Успех убирает скачивание с экрана (сборка видна в «Установленных»).
-    fn poll_build_download(&mut self) {
+    pub fn poll_build_download(&mut self) {
         let mut succeeded = false;
         {
             let Some(download) = self.build_download.as_mut() else {
@@ -2009,8 +1251,53 @@ impl App {
         }
     }
 
+    /// Сделать llama-server из установленной сборки активным бинарником.
+    pub fn activate_build_binary(&mut self, tag: String, binary: PathBuf) {
+        if self.server_form.binary != binary {
+            self.server_form.binary = binary.clone();
+            self.mark_dirty();
+        }
+        log::info!("Активная сборка: {tag} ({})", binary.display());
+    }
+
+    /// Имена пресетов, чей бинарник лежит внутри каталога сборки.
+    pub fn presets_using_dir(&self, dir: &std::path::Path) -> Vec<String> {
+        self.presets
+            .list()
+            .into_iter()
+            .filter(|name| {
+                self.presets
+                    .load(name)
+                    .is_ok_and(|preset| preset.binary.starts_with(dir))
+            })
+            .collect()
+    }
+
+    /// Удалить установленную сборку с диска. Если её бинарник был активным —
+    /// сбросить конфигурацию; о пресетах пользователь предупреждён заранее.
+    pub fn delete_build(&mut self, build: &builds::InstalledBuild) {
+        if self.server_form.binary.starts_with(&build.dir) {
+            self.server_form.binary = PathBuf::new();
+            self.mark_dirty();
+            log::warn!(
+                "Удалённая сборка была активной — бинарник сервера сброшен, укажите другой"
+            );
+        }
+        match std::fs::remove_dir_all(&build.dir) {
+            Ok(()) => log::info!("Сборка {} удалена ({})", build.label(), build.dir.display()),
+            Err(e) => log::error!(
+                "Не удалось удалить {}: {e:#}",
+                build.dir.display()
+            ),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // GGUF-метаданные и оценка памяти
+    // -----------------------------------------------------------------------
+
     /// Прочитать GGUF-заголовок текущей модели (с кэшем по пути).
-    fn cached_gguf_info(&mut self) -> Option<(PathBuf, Option<gguf::GgufInfo>)> {
+    pub fn cached_gguf_info(&mut self) -> Option<(PathBuf, Option<gguf::GgufInfo>)> {
         let path = self.server_form.model.clone();
         if path.as_os_str().is_empty() {
             return None;
@@ -2082,7 +1369,7 @@ impl App {
     }
 
     /// Оценка памяти для текущей модели: (модель, оценка).
-    fn memory_estimate(&mut self) -> Option<(gguf::GgufInfo, gguf::MemoryEstimate)> {
+    pub fn memory_estimate(&mut self) -> Option<(gguf::GgufInfo, gguf::MemoryEstimate)> {
         let (path, info) = self.cached_gguf_info()?;
         let info = info?;
         let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
@@ -2093,462 +1380,11 @@ impl App {
             gguf::estimate_memory(&info, file_size, self.ctx_from_params(), self.kv_elem_bytes(), gpu_offload_all)?;
         Some((info, estimate))
     }
-
-    /// Строка метаданных GGUF и цветная оценка памяти под путём модели.
-    fn memory_estimate_section(&mut self, ui: &mut egui::Ui) {
-        let Some((path, info)) = self.cached_gguf_info() else {
-            return;
-        };
-        let Some(info) = info else {
-            if path.is_file() {
-                ui.label(
-                    RichText::new("Не удалось прочитать GGUF-заголовок — оценка памяти недоступна")
-                        .small()
-                        .color(theme::WARN_YELLOW),
-                );
-            }
-            return;
-        };
-
-        let quant = info
-            .file_type
-            .and_then(gguf::file_type_label)
-            .map(str::to_string)
-            .or_else(|| {
-                path.file_name()
-                    .and_then(|n| n.to_str())
-                    .and_then(huggingface::quant_from_filename)
-            });
-        let mut meta = format!(
-            "{} · {} слоёв{}",
-            info.arch.as_deref().unwrap_or("gguf"),
-            info.n_layers.map_or("?".into(), |l| l.to_string()),
-            quant.map_or(String::new(), |q| format!(" · {q}"))
-        );
-        if let Some(train_ctx) = info.ctx_train {
-            meta.push_str(&format!(" · контекст до {train_ctx}"));
-        }
-        ui.label(RichText::new(meta).small().weak());
-
-        let Some((_, estimate)) = self.memory_estimate() else {
-            return;
-        };
-        const GB: f64 = 1024.0 * 1024.0 * 1024.0;
-        let total_gb = estimate.weights_bytes as f64 + estimate.kv_cache_bytes as f64;
-        let color = if total_gb >= 16.0 * GB {
-            theme::ERR_RED
-        } else if total_gb >= 8.0 * GB {
-            theme::WARN_YELLOW
-        } else {
-            theme::OK_GREEN
-        };
-        let note = if estimate.gpu_bytes >= total_gb as u64 {
-            "вся модель на GPU"
-        } else if estimate.gpu_bytes > 0 {
-            "частично на GPU"
-        } else {
-            "только CPU/RAM"
-        };
-        ui.label(
-            RichText::new(format!(
-                "Оценка памяти: веса {} + KV-кэш {} (ctx {}) ≈ {} — {note} · приблизительно",
-                format_size(estimate.weights_bytes),
-                format_size(estimate.kv_cache_bytes),
-                estimate.ctx_used,
-                format_size(total_gb as u64),
-            ))
-            .small()
-            .color(color),
-        );
-    }
-
-    /// Сделать llama-server из установленной сборки активным бинарником.
-    fn activate_build_binary(&mut self, tag: String, binary: PathBuf) {
-        if self.server_form.binary != binary {
-            self.server_form.binary = binary.clone();
-            self.mark_dirty();
-        }
-        log::info!("Активная сборка: {tag} ({})", binary.display());
-    }
-
-    /// Имена пресетов, чей бинарник лежит внутри каталога сборки.
-    fn presets_using_dir(&self, dir: &std::path::Path) -> Vec<String> {
-        self.presets
-            .list()
-            .into_iter()
-            .filter(|name| {
-                self.presets
-                    .load(name)
-                    .is_ok_and(|preset| preset.binary.starts_with(dir))
-            })
-            .collect()
-    }
-
-    /// Удалить установленную сборку с диска. Если её бинарник был активным —
-    /// сбросить конфигурацию; о пресетах пользователь предупреждён заранее.
-    fn delete_build(&mut self, build: &builds::InstalledBuild) {
-        if self.server_form.binary.starts_with(&build.dir) {
-            self.server_form.binary = PathBuf::new();
-            self.mark_dirty();
-            log::warn!(
-                "Удалённая сборка была активной — бинарник сервера сброшен, укажите другой"
-            );
-        }
-        match std::fs::remove_dir_all(&build.dir) {
-            Ok(()) => log::info!("Сборка {} удалена ({})", build.label(), build.dir.display()),
-            Err(e) => log::error!(
-                "Не удалось удалить {}: {e:#}",
-                build.dir.display()
-            ),
-        }
-    }
-
-    fn settings_page(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label("Все настройки сохраняются автоматически.");
-            if self.config_dirty {
-                ui.label(RichText::new("● не сохранено").color(theme::WARN_YELLOW));
-            }
-            if ui.button("Сохранить сейчас").clicked() {
-                self.save_settings();
-            }
-        });
-        ui.add_space(8.0);
-
-        ui.add_space(12.0);
-        ui.separator();
-        ui.heading(RichText::new("Каталоги").size(16.0));
-        let paths_changed = {
-            let s = &mut self.settings;
-            let mut changed = false;
-            changed |= path_row(ui, "Каталог моделей", &mut s.models_dir, "куда скачиваются GGUF-модели", PathPick::Folder);
-            changed |= path_row(ui, "Каталог сборок", &mut s.builds_dir, "куда скачиваются бинарники llama.cpp", PathPick::Folder);
-            changed |= path_row(ui, "Каталог логов", &mut s.logs_dir, "куда пишутся журналы", PathPick::Folder);
-            changed
-        };
-        if paths_changed {
-            self.mark_dirty();
-        }
-
-        ui.add_space(12.0);
-        ui.separator();
-        ui.heading(RichText::new("HuggingFace").size(16.0));
-        let mut token = self.settings.hf_token.clone();
-        let token_response = ui.add(
-            egui::TextEdit::singleline(&mut token)
-                .password(true)
-                .hint_text("hf_...")
-                .desired_width(ui.available_width()),
-        );
-        if token_response.changed() {
-            self.settings.hf_token = token.trim().to_string();
-            self.mark_dirty();
-        }
-        ui.label(
-            RichText::new("⚠ Токен хранится в конфиг-файле в открытом виде. Нужен только для приватных/gated-моделей.")
-                .small()
-                .color(theme::WARN_YELLOW),
-        );
-
-        ui.add_space(12.0);
-        ui.separator();
-        ui.heading(RichText::new("Интерфейс").size(16.0));
-        ui.horizontal(|ui| {
-            ui.label("Тема:");
-            for mode in ThemeMode::ALL {
-                if ui
-                    .selectable_label(self.settings.theme == mode, mode.label())
-                    .clicked()
-                {
-                    self.settings.theme = mode;
-                    self.mark_dirty();
-                }
-            }
-        });
-        let mut debug = self.settings.debug_logging;
-        if ui
-            .checkbox(&mut debug, "Debug-логирование (подробные сообщения в журнал)")
-            .changed()
-        {
-            self.settings.debug_logging = debug;
-            if let Some(handle) = &self.log_handle {
-                handle.set_debug(debug);
-            }
-            self.mark_dirty();
-        }
-        ui.label(
-            RichText::new(format!(
-                "Файл журнала: {}",
-                self.settings.logs_dir.join("manager.log").display()
-            ))
-            .small(),
-        );
-
-        ui.add_space(12.0);
-        ui.separator();
-        ui.heading(RichText::new("Автовосстановление сервера").size(16.0));
-        let mut ar = self.settings.auto_restore.clone();
-        ui.checkbox(&mut ar.enabled, "Автоматически перезапускать llama-server при падении");
-        ui.add_enabled_ui(ar.enabled, |ui| {
-            egui::Grid::new("auto_restore_grid")
-                .num_columns(2)
-                .spacing([12.0, 6.0])
-                .show(ui, |ui| {
-                    ui.label("Макс. попыток рестарта:");
-                    ui.add(
-                        egui::DragValue::new(&mut ar.max_restarts)
-                            .range(1..=20)
-                            .suffix(" раз"),
-                    );
-                    ui.end_row();
-                    ui.label("Окно времени:");
-                    ui.add(
-                        egui::DragValue::new(&mut ar.window_secs)
-                            .range(30..=3600)
-                            .speed(10.0)
-                            .suffix(" сек"),
-                    );
-                    ui.end_row();
-                    ui.label("Задержка между попытками (backoff):");
-                    ui.add(
-                        egui::DragValue::new(&mut ar.backoff_start_secs)
-                            .range(1..=60)
-                            .suffix(" сек"),
-                    );
-                    ui.end_row();
-                });
-            ui.label(
-                RichText::new("Задержка удваивается после каждой попытки. При исчерпании лимита сервер остаётся в состоянии «упал» и требуется вмешательство.")
-                    .small(),
-            );
-        });
-        if ar != self.settings.auto_restore {
-            self.server.set_auto_restore(ar.clone());
-            self.settings.auto_restore = ar;
-            self.mark_dirty();
-        }
-    }
-
-}
-
-/// Minimum width reserved for parameter/path labels before the value widget.
-const LABEL_WIDTH: f32 = 210.0;
-/// Width reserved for the "Обзор…" browse button plus margins.
-const BROWSE_BUTTON_WIDTH: f32 = 88.0;
-
-/// What kind of item the file dialog should let the user pick.
-#[derive(Clone, Copy)]
-enum PathPick {
-    File,
-    Folder,
-}
-
-/// One parameter row: enable checkbox + value widget depending on kind.
-/// Non-bool parameters render as `☑ Name [widget……………]` on a single line.
-/// Returns true when the parameter state changed during this frame.
-fn param_row(ui: &mut egui::Ui, def: &ParamDef, state: &mut ParamState) -> bool {
-    let before = state.clone();
-    let mut tooltip = format!("{}\n\nФлаг: {}", def.description, def.flag);
-    if let Some(short) = &def.short {
-        tooltip.push_str(&format!(" / {short}"));
-    }
-
-    match def.kind {
-        // Bool parameters have no value: the checkbox is the whole control.
-        ParamKind::Bool => {
-            let mut on = state.is_enabled(&def.id);
-            if ui
-                .checkbox(&mut on, &def.name)
-                .on_hover_text(&tooltip)
-                .changed()
-            {
-                state.set(&def.id, on);
-            }
-        }
-        _ => {
-            let new_value = ui
-                .horizontal(|ui| {
-                    let mut enabled = state.is_enabled(&def.id);
-                    ui.checkbox(&mut enabled, &def.name)
-                        .on_hover_text(&tooltip)
-                        .changed()
-                        .then(|| state.set(&def.id, enabled));
-
-                    let value = state
-                        .entries
-                        .get(&def.id)
-                        .and_then(|e| e.value.clone())
-                        .or_else(|| def.default.clone());
-                    let field_width = (ui.available_width() - 8.0).max(120.0);
-
-                    match def.kind {
-                        ParamKind::Int => {
-                            let min = def.min.unwrap_or(i64::MIN as f64) as i64;
-                            let max = def.max.unwrap_or(i64::MAX as f64).min(i64::MAX as f64) as i64;
-                            let mut v = value.and_then(|x| x.as_i64()).unwrap_or(min.max(0));
-                            if ui
-                                .add_sized(
-                                    [110.0, 20.0],
-                                    egui::DragValue::new(&mut v)
-                                        .range(min..=max)
-                                        .custom_formatter(|n, _| format!("{n}"))
-                                        .custom_parser(|s| {
-                                            s.trim().parse::<i64>().ok().map(|n| n as f64)
-                                        }),
-                                )
-                                .on_hover_text(&tooltip)
-                                .changed()
-                            {
-                                return Some(serde_json::json!(v));
-                            }
-                        }
-                        ParamKind::Float => {
-                            let min = def.min.unwrap_or(f64::MIN);
-                            let max = def.max.unwrap_or(f64::MAX);
-                            let mut v = value.and_then(|x| x.as_f64()).unwrap_or(min.max(0.0));
-                            if ui
-                                .add_sized(
-                                    [110.0, 20.0],
-                                    egui::DragValue::new(&mut v)
-                                        .range(min..=max)
-                                        .speed(0.05),
-                                )
-                                .on_hover_text(&tooltip)
-                                .changed()
-                            {
-                                return Some(serde_json::json!(v));
-                            }
-                        }
-                        ParamKind::Enum => {
-                            let previous = value
-                                .as_ref()
-                                .and_then(|x| x.as_str())
-                                .unwrap_or_default()
-                                .to_string();
-                            let mut current = previous.clone();
-                            egui::ComboBox::from_id_salt(def.id.clone())
-                                .selected_text(current.clone())
-                                .width(150.0)
-                                .show_ui(ui, |ui| {
-                                    for option in &def.options {
-                                        ui.selectable_value(&mut current, option.clone(), option);
-                                    }
-                                })
-                                .response
-                                .on_hover_text(&tooltip);
-                            if current != previous {
-                                return Some(serde_json::json!(current));
-                            }
-                        }
-                        ParamKind::String => {
-                            let mut text = value
-                                .as_ref()
-                                .and_then(|x| x.as_str())
-                                .unwrap_or_default()
-                                .to_string();
-                            if ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut text)
-                                        .desired_width(field_width),
-                                )
-                                .on_hover_text(&tooltip)
-                                .changed()
-                            {
-                                return Some(serde_json::json!(text.trim()));
-                            }
-                        }
-                        ParamKind::Path => {
-                            let mut text = value
-                                .as_ref()
-                                .and_then(|x| x.as_str())
-                                .unwrap_or_default()
-                                .to_string();
-                            let edit_width = (field_width - BROWSE_BUTTON_WIDTH).max(120.0);
-                            if ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut text)
-                                        .desired_width(edit_width),
-                                )
-                                .on_hover_text(&tooltip)
-                                .changed()
-                            {
-                                return Some(serde_json::json!(text.trim()));
-                            }
-                            if ui.small_button("Обзор…").clicked()
-                                && let Some(file) = rfd::FileDialog::new()
-                                    .set_title(format!("Выберите: {}", def.name))
-                                    .pick_file()
-                            {
-                                return Some(serde_json::json!(file.display().to_string()));
-                            }
-                        }
-                        ParamKind::Bool => unreachable!(),
-                    }
-                    None
-                })
-                .inner;
-
-            if let Some(value) = new_value {
-                state.set_value(&def.id, value);
-            }
-        }
-    }
-    before != *state
-}
-
-/// One path picker row: label, editable path, browse button.
-/// `pick` selects whether the dialog opens files or folders.
-fn path_row(ui: &mut egui::Ui, label: &str, path: &mut PathBuf, hint: &str, pick: PathPick) -> bool {
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.add_sized([LABEL_WIDTH, 18.0], egui::Label::new(label))
-            .on_hover_text(hint);
-        let mut text = path.display().to_string();
-        let edit_width = (ui.available_width() - BROWSE_BUTTON_WIDTH).max(160.0);
-        let response = ui.add(
-            egui::TextEdit::singleline(&mut text).desired_width(edit_width),
-        );
-        if response.changed() {
-            *path = PathBuf::from(text.trim());
-            changed = true;
-        }
-        if ui.button("Обзор…").clicked() {
-            // The dialog must be created and awaited only on click —
-            // pick_file/pick_folder are blocking calls.
-            let dialog = rfd::FileDialog::new().set_title(format!("Выберите: {label}"));
-            let picked = match pick {
-                PathPick::File => dialog.pick_file(),
-                PathPick::Folder => dialog.pick_folder(),
-            };
-            if let Some(new_path) = picked {
-                *path = new_path;
-                changed = true;
-            }
-        }
-    });
-    changed
-}
-
-/// Human-readable file size: «245 МБ», «1.4 ГБ».
-fn format_size(bytes: u64) -> String {
-    const KB: f64 = 1024.0;
-    const MB: f64 = KB * KB;
-    const GB: f64 = MB * KB;
-    let bytes = bytes as f64;
-    if bytes >= GB {
-        format!("{:.1} ГБ", bytes / GB)
-    } else if bytes >= MB {
-        format!("{:.0} МБ", bytes / MB)
-    } else if bytes >= KB {
-        format!("{:.0} КБ", bytes / KB)
-    } else {
-        format!("{bytes} Б")
-    }
 }
 
 /// GGUF-файлы в библиотеке моделей (в каталоге и на один уровень вглубь),
 /// отсортированные по имени.
-fn library_models(models_dir: &std::path::Path) -> Vec<PathBuf> {
+pub fn library_models(models_dir: &std::path::Path) -> Vec<PathBuf> {
     fn gguf(p: &std::path::Path) -> bool {
         p.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("gguf")) == Some(true)
     }
@@ -2577,7 +1413,8 @@ fn library_models(models_dir: &std::path::Path) -> Vec<PathBuf> {
 
 /// Обрезать список ассетов до первых `max_tags` разных тегов релизов
 /// (релизы идут от новых к старым).
-fn limit_releases(assets: Vec<github::BuildAsset>, max_tags: usize) -> Vec<github::BuildAsset> {    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+fn limit_releases(assets: Vec<github::BuildAsset>, max_tags: usize) -> Vec<github::BuildAsset> {
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     assets
         .into_iter()
         .filter(|asset| {
@@ -2626,63 +1463,16 @@ mod tests {
     }
 }
 
-/// Color and human hint for a server state, shared by the sidebar and the
-/// status bar on the Server page.
-fn state_status(state: ServerState) -> (Color32, &'static str) {
-    match state {
-        ServerState::Stopped => (Color32::from_rgb(0x8A, 0x94, 0xA6), "Сервер не запущен"),
-        ServerState::Starting => (
-            theme::WARN_YELLOW,
-            "Идёт загрузка модели, проверяется готовность…",
-        ),
-        ServerState::Ready => (
-            theme::OK_GREEN,
-            "Сервер отвечает и готов принимать запросы",
-        ),
-        ServerState::RestartScheduled => (
-            theme::WARN_YELLOW,
-            "Процесс упал, ожидается автоматический перезапуск",
-        ),
-        ServerState::Crashed => (theme::ERR_RED, "Требуется вмешательство пользователя"),
-    }
-}
-
-fn level_color(level: log::Level) -> Color32 {
-    match level {
-        log::Level::Error => theme::ERR_RED,
-        log::Level::Warn => theme::WARN_YELLOW,
-        log::Level::Debug | log::Level::Trace => Color32::from_rgb(0x8A, 0x94, 0xA6),
-        log::Level::Info => Color32::from_rgb(0xB9, 0xC2, 0xD0),
-    }
-}
-
-fn open_folder(path: &std::path::Path) {
-    let result = if cfg!(target_os = "windows") {
-        std::process::Command::new("explorer").arg(path).spawn()
-    } else {
-        std::process::Command::new("xdg-open").arg(path).spawn()
-    };
-    if let Err(e) = result {
-        log::warn!("Не удалось открыть папку {}: {e}", path.display());
-    }
-}
-
-fn open_url(url: &str) {
-    let result = if cfg!(target_os = "windows") {
-        std::process::Command::new("cmd").args(["/C", "start", url]).spawn()
-    } else {
-        std::process::Command::new("xdg-open").arg(url).spawn()
-    };
-    if let Err(e) = result {
-        log::warn!("Не удалось открыть {url}: {e}");
-    }
-}
-
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if self.applied_theme != Some(self.settings.theme) {
             theme::apply(&ui.ctx().clone(), self.settings.theme);
             self.applied_theme = Some(self.settings.theme);
+        }
+
+        // Масштаб интерфейса (0.8x–1.5x).
+        if (ui.ctx().zoom_factor() - self.settings.ui_zoom).abs() > 0.001 {
+            ui.ctx().set_zoom_factor(self.settings.ui_zoom);
         }
 
         // Pick up a catalog fetched in the background, if any.

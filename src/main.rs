@@ -10,6 +10,7 @@ mod params;
 mod presets;
 mod process_mgr;
 mod theme;
+mod ui;
 
 use app::App;
 

@@ -1,11 +1,28 @@
 use egui::{Color32, CornerRadius, Style, Theme, ThemePreference, Visuals};
 
+// --- Design tokens (dark theme baseline) ---
+/// App background / side panels.
+pub const BG: Color32 = Color32::from_rgb(0x0F, 0x11, 0x17);
+/// Cards and containers.
+pub const CARD: Color32 = Color32::from_rgb(0x18, 0x1B, 0x24);
+/// Inputs and nested panels.
+pub const INPUT: Color32 = Color32::from_rgb(0x21, 0x26, 0x34);
+/// 1px borders.
+pub const BORDER: Color32 = Color32::from_rgb(0x2C, 0x33, 0x45);
+/// Muted secondary text.
+pub const MUTED: Color32 = Color32::from_rgb(0x94, 0xA3, 0xB8);
+
 pub const ACCENT: Color32 = Color32::from_rgb(0x3B, 0x82, 0xF6);
 #[allow(dead_code)] // reserved for hover states
 pub const ACCENT_HOVER: Color32 = Color32::from_rgb(0x60, 0x9B, 0xF8);
-pub const OK_GREEN: Color32 = Color32::from_rgb(0x16, 0xA3, 0x4A);
-pub const WARN_YELLOW: Color32 = Color32::from_rgb(0xD9, 0x94, 0x06);
-pub const ERR_RED: Color32 = Color32::from_rgb(0xDC, 0x2C, 0x36);
+pub const OK_GREEN: Color32 = Color32::from_rgb(0x10, 0xB9, 0x81);
+pub const WARN_YELLOW: Color32 = Color32::from_rgb(0xF5, 0x9E, 0x0B);
+pub const ERR_RED: Color32 = Color32::from_rgb(0xEF, 0x44, 0x44);
+
+/// Corner radius for buttons/inputs.
+pub const RADIUS_WIDGET: u8 = 6;
+/// Corner radius for cards/panels.
+pub const RADIUS_CARD: u8 = 8;
 
 /// User-selectable UI theme.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -38,47 +55,54 @@ impl ThemeMode {
 
 /// Style shared by both themes: accent color, rounded corners, spacing.
 fn common(style: &mut Style) {
-    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-    style.spacing.button_padding = egui::vec2(12.0, 6.0);
-    style.spacing.menu_margin = egui::Margin::same(6);
-    style.spacing.icon_width_inner = 16.0;
-    style.spacing.icon_width = 20.0;
+    let s = &mut style.spacing;
+    s.item_spacing = egui::vec2(8.0, 10.0);
+    s.button_padding = egui::vec2(12.0, 6.0);
+    s.menu_margin = egui::Margin::same(6);
+    s.window_margin = egui::Margin::same(16);
+    s.icon_width_inner = 16.0;
+    s.icon_width = 20.0;
+    s.combo_width = 180.0;
 
     for w in [
         &mut style.visuals.widgets.inactive,
         &mut style.visuals.widgets.hovered,
         &mut style.visuals.widgets.active,
     ] {
-        w.corner_radius = CornerRadius::same(6);
+        w.corner_radius = CornerRadius::same(RADIUS_WIDGET);
     }
 
     style.visuals.selection.bg_fill = ACCENT.linear_multiply(0.35);
     style.visuals.selection.stroke = egui::Stroke::new(1.0, ACCENT);
+    style.visuals.text_cursor.stroke = egui::Stroke::new(1.5, ACCENT);
 }
 
-/// Modern dark theme with an accent color.
+/// Dark theme: developer-dashboard palette (Raycast/Linear style).
 pub fn dark_style() -> Style {
     let mut style = Style::default();
     let v = &mut style.visuals;
     *v = Visuals::dark();
 
-    v.panel_fill = Color32::from_rgb(0x14, 0x17, 0x1F);
-    v.window_fill = Color32::from_rgb(0x1A, 0x1E, 0x27);
-    v.extreme_bg_color = Color32::from_rgb(0x0D, 0x0F, 0x14);
-    v.faint_bg_color = Color32::from_rgb(0x21, 0x26, 0x33);
+    v.panel_fill = BG;
+    v.window_fill = CARD;
+    v.extreme_bg_color = INPUT;
+    v.faint_bg_color = CARD;
 
-    v.window_stroke = egui::Stroke::new(1.0, Color32::from_rgb(0x2A, 0x30, 0x3D));
-    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(0x2A, 0x30, 0x3D));
+    v.window_stroke = egui::Stroke::new(1.0, BORDER);
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, BORDER);
+    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, MUTED);
+    v.widgets.noninteractive.bg_fill = CARD;
 
     let interactive = [
-        (&mut v.widgets.inactive, (0x24, 0x2A, 0x38)),
-        (&mut v.widgets.hovered, (0x2D, 0x35, 0x47)),
-        (&mut v.widgets.active, (0x1E, 0x23, 0x2F)),
+        (&mut v.widgets.inactive, INPUT),
+        (&mut v.widgets.hovered, Color32::from_rgb(0x2A, 0x31, 0x44)),
+        (&mut v.widgets.active, Color32::from_rgb(0x1A, 0x1F, 0x2C)),
     ];
-    for (w, (r, g, b)) in interactive {
-        w.bg_fill = Color32::from_rgb(r, g, b);
-        w.weak_bg_fill = Color32::from_rgb(r, g, b);
-        w.fg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(0xD7, 0xDD, 0xE8));
+    for (w, fill) in interactive {
+        w.bg_fill = fill;
+        w.weak_bg_fill = fill;
+        w.bg_stroke = egui::Stroke::new(1.0, BORDER);
+        w.fg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(0xE2, 0xE7, 0xF0));
     }
     v.widgets.hovered.bg_fill = ACCENT.linear_multiply(0.28);
     v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, Color32::WHITE);
@@ -89,7 +113,7 @@ pub fn dark_style() -> Style {
     style
 }
 
-/// Clean light theme with the same accent color.
+/// Light theme with the same accent color and layout metrics.
 pub fn light_style() -> Style {
     let mut style = Style::default();
     let v = &mut style.visuals;

@@ -9,6 +9,7 @@ chrono = "0.4.45"
 directories = "6.0.0"
 eframe = "0.36.1"
 egui = "0.36.1"
+egui_extras = { version = "0.36.1", default-features = false }
 flate2 = "1.1.10"
 log = "0.4.34"
 rfd = "0.17.2"
