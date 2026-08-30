@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::download::{self, DownloadRequest};
+use crate::download::{self, CancelFlag, DownloadRequest};
 
 const API_BASE: &str = "https://huggingface.co";
 const USER_AGENT: &str = "llamacpp-manager";
@@ -73,6 +73,7 @@ pub fn download_model_file(
     path: &str,
     dest: &std::path::Path,
     token: Option<&str>,
+    cancel: CancelFlag,
     progress: impl FnMut(u64, u64),
 ) -> Result<()> {
     let mut headers = vec![("User-Agent".to_string(), USER_AGENT.to_string())];
@@ -87,6 +88,7 @@ pub fn download_model_file(
             dest: dest.to_path_buf(),
             headers,
             resume: true,
+            cancel,
         },
         progress,
     )
@@ -255,12 +257,12 @@ mod tests {
         let root = std::env::temp_dir().join(format!("hf-download-live-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let dest = root.join("config.json");
-        download_model_file("openai-community/gpt2", "config.json", &dest, None, |_, _| {})
+        download_model_file("openai-community/gpt2", "config.json", &dest, None, CancelFlag::new(), |_, _| {})
             .expect("скачивание");
         let size = std::fs::metadata(&dest).unwrap().len();
         assert!(size > 0);
         // Повторное скачивание с resume=true перезаписывает файл без ошибок.
-        download_model_file("openai-community/gpt2", "config.json", &dest, None, |_, _| {})
+        download_model_file("openai-community/gpt2", "config.json", &dest, None, CancelFlag::new(), |_, _| {})
             .expect("повторное скачивание");
         assert_eq!(std::fs::metadata(&dest).unwrap().len(), size);
         std::fs::remove_dir_all(&root).ok();

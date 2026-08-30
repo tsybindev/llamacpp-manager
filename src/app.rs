@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use crate::download::CancelFlag;
+
 use egui::ScrollArea;
 
 use crate::builds;
@@ -23,26 +25,19 @@ pub enum Page {
     Server,
     Models,
     Builds,
+    Logs,
     Settings,
 }
 
 impl Page {
-    const ALL: [Page; 4] = [Page::Server, Page::Models, Page::Builds, Page::Settings];
-
-    pub fn icon(self) -> &'static str {
-        match self {
-            Page::Server => "▦",
-            Page::Models => "⛁",
-            Page::Builds => "⧉",
-            Page::Settings => "⚙",
-        }
-    }
+    const ALL: [Page; 5] = [Page::Server, Page::Models, Page::Builds, Page::Logs, Page::Settings];
 
     pub fn label(self) -> &'static str {
         match self {
             Page::Server => "Сервер",
             Page::Models => "Модели",
             Page::Builds => "Сборки",
+            Page::Logs => "Логи",
             Page::Settings => "Настройки",
         }
     }
@@ -52,6 +47,7 @@ impl Page {
             Page::Server => "Управление сервером",
             Page::Models => "Модели",
             Page::Builds => "Сборки llama.cpp",
+            Page::Logs => "Журналы",
             Page::Settings => "Настройки",
         }
     }
@@ -61,6 +57,7 @@ impl Page {
             Page::Server => "llama-server",
             Page::Models => "HuggingFace и локальная библиотека",
             Page::Builds => "релизы llama.cpp",
+            Page::Logs => "вывод llama-server и приложения",
             Page::Settings => "",
         }
     }
@@ -146,6 +143,8 @@ pub struct ModelDownload {
     pub total: u64,
     pub rx: mpsc::Receiver<ModelDownloadMsg>,
     pub error: Option<String>,
+    /// Общий флаг отмены: выставляется из UI, читается в потоке скачивания.
+    pub cancel: CancelFlag,
 }
 
 /// Message from the background build download thread.
@@ -164,6 +163,8 @@ pub struct BuildDownload {
     /// Результат при ошибке (при успехе скачивание убирается сразу —
     /// сборка появляется в списке «Установленные сборки»).
     pub error: Option<String>,
+    /// Общий флаг отмены: выставляется из UI, читается в потоке скачивания.
+    pub cancel: CancelFlag,
 }
 
 /// Editable server launch parameters.
@@ -397,12 +398,15 @@ impl App {
         for page in Page::ALL {
             let selected = self.page == page;
             let response = if self.sidebar_collapsed {
-                let button = egui::Button::new(egui::RichText::new(page.icon()).size(15.0))
+                // Узкий режим: первая буква названия (иконки в шрифте egui
+                // покрыты не полностью — текст надёжнее).
+                let letter = page.label().chars().next().unwrap_or('?').to_string();
+                let button = egui::Button::new(egui::RichText::new(letter).size(14.0))
                     .selected(selected)
                     .min_size(egui::vec2(ui.available_width(), 32.0));
                 ui.add(button).on_hover_text(page.title())
             } else {
-                ui::nav_item(ui, selected, page.icon(), page.label())
+                ui::nav_item(ui, selected, page.label())
             };
             if response.clicked() {
                 self.page = page;
@@ -457,20 +461,25 @@ impl App {
                 }
             }
         } else {
+            // Компактная карточка: статус + порт в одну строку, кнопки — во
+            // вторую, чтобы всё помещалось даже в узкий сайдбар.
             ui::card(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui::status_dot(ui, color, 4.0);
-                    ui.label(egui::RichText::new(state.label()).size(13.0).strong());
+                    ui.label(egui::RichText::new(state.label()).size(12.5).strong())
+                        .on_hover_text(hint);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(format!(":{port}"))
+                                .monospace()
+                                .size(11.0)
+                                .color(crate::theme::MUTED),
+                        );
+                    });
                 });
-                ui.label(
-                    egui::RichText::new(format!("порт {port}"))
-                        .size(11.0)
-                        .color(crate::theme::MUTED),
-                )
-                .on_hover_text(hint);
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
-                    ui.style_mut().spacing.item_spacing.x = 6.0;
+                    ui.style_mut().spacing.item_spacing.x = 4.0;
                     if ui
                         .add_enabled(!running, egui::Button::new("▶ Запустить").small())
                         .on_hover_text("Запустить сервер")
@@ -479,7 +488,7 @@ impl App {
                         self.try_start_server();
                     }
                     if ui
-                        .add_enabled(running, egui::Button::new("■ Остановить").small())
+                        .add_enabled(running, egui::Button::new("■ Стоп").small())
                         .on_hover_text("Остановить сервер")
                         .clicked()
                     {
@@ -513,6 +522,7 @@ impl App {
             Page::Server => ui::server::show(self, ui),
             Page::Models => ui::models::show(self, ui),
             Page::Builds => ui::builds::show(self, ui),
+            Page::Logs => ui::logs::show(self, ui),
             Page::Settings => ui::settings::show(self, ui),
         }
         ui.add_space(16.0);
@@ -929,6 +939,8 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let dest = self.settings.models_dir.join(&file.path);
         let token = self.hf_token().map(str::to_string);
+        let cancel = CancelFlag::new();
+        let thread_cancel = cancel.clone();
         let thread_repo = repo.clone();
         let thread_path = file.path.clone();
         let _ = std::thread::Builder::new()
@@ -939,6 +951,7 @@ impl App {
                     &thread_path,
                     &dest,
                     token.as_deref(),
+                    thread_cancel,
                     |downloaded, total| {
                         let _ = tx.send(ModelDownloadMsg::Progress(downloaded, total));
                     },
@@ -954,7 +967,25 @@ impl App {
             total: file.size,
             rx,
             error: None,
+            cancel,
         });
+    }
+
+    /// Отменить текущее скачивание модели (частичный файл сохраняется
+    /// и докачается при следующем «Скачать» через Range).
+    pub fn cancel_model_download(&mut self) {
+        if let Some(download) = self.model_download.as_ref() {
+            download.cancel.cancel();
+            log::info!("Отмена скачивания модели {}/{}", download.repo, download.path);
+        }
+    }
+
+    /// Отменить текущее скачивание сборки.
+    pub fn cancel_build_download(&mut self) {
+        if let Some(download) = self.build_download.as_ref() {
+            download.cancel.cancel();
+            log::info!("Отмена скачивания сборки {}", download.asset.asset.name);
+        }
     }
 
     /// Подобрать сообщения из фонового потока скачивания модели.
@@ -979,8 +1010,14 @@ impl App {
                         break;
                     }
                     Ok(ModelDownloadMsg::Done(Err(message))) => {
-                        download.error = Some(message.clone());
-                        log::error!("Не удалось скачать модель: {message}");
+                        if download.cancel.is_cancelled() {
+                            // Отмена из UI — не ошибка, панель закрывается тихо.
+                            log::info!("Скачивание модели отменено");
+                            succeeded = true;
+                        } else {
+                            download.error = Some(message.clone());
+                            log::error!("Не удалось скачать модель: {message}");
+                        }
                         break;
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
@@ -1182,10 +1219,12 @@ impl App {
         let name = asset.asset.name.clone();
         let tag = asset.tag.clone();
         let thread_asset = asset.clone();
+        let cancel = CancelFlag::new();
+        let thread_cancel = cancel.clone();
         let _ = std::thread::Builder::new()
             .name("build-download".into())
             .spawn(move || {
-                let outcome = store.install(&thread_asset, |progress| {
+                let outcome = store.install(&thread_asset, thread_cancel, |progress| {
                     let _ = tx.send(BuildDownloadMsg::Progress(progress));
                 });
                 let _ = tx.send(BuildDownloadMsg::Done(
@@ -1200,6 +1239,7 @@ impl App {
             extracting: false,
             rx,
             error: None,
+            cancel,
         });
     }
 
@@ -1231,8 +1271,14 @@ impl App {
                         break;
                     }
                     Ok(BuildDownloadMsg::Done(Err(message))) => {
-                        download.error = Some(message.clone());
-                        log::error!("Не удалось установить сборку: {message}");
+                        if download.cancel.is_cancelled() {
+                            // Отмена из UI — не ошибка, панель закрывается тихо.
+                            log::info!("Скачивание сборки отменено");
+                            succeeded = true;
+                        } else {
+                            download.error = Some(message.clone());
+                            log::error!("Не удалось установить сборку: {message}");
+                        }
                         break;
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
@@ -1503,11 +1549,17 @@ impl eframe::App for App {
             }
         }
 
-        let nav_width = if self.sidebar_collapsed { 56.0 } else { 200.0 };
-        egui::Panel::left("nav")
-            .resizable(false)
-            .exact_size(nav_width)
-            .show(ui, |ui| self.nav_panel(ui));
+        let collapsed = self.sidebar_collapsed;
+        let panel = egui::Panel::left("nav");
+        let panel = if collapsed {
+            panel.exact_size(56.0)
+        } else {
+            panel
+                .resizable(true)
+                .default_size(230.0)
+                .size_range(180.0..=360.0)
+        };
+        panel.show(ui, |ui| self.nav_panel(ui));
 
         egui::CentralPanel::default().show(ui, |ui| {
             ScrollArea::vertical().show(ui, |ui| self.page_content(ui));

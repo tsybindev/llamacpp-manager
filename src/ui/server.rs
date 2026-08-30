@@ -1,16 +1,15 @@
 //! Экран «Сервер»: hero-статус, пресеты, конфигурация, вкладки параметров,
 //! CLI-предпросмотр и журналы.
 
-use egui::{Color32, RichText, ScrollArea};
+use egui::{Color32, RichText};
 
 use crate::app::App;
 use crate::params;
 use crate::process_mgr::ServerState;
 use crate::theme::{self, MUTED};
 use crate::ui::{
-    self, cli_preview, card, card_titled, format_size, gauge_color, level_color, line_color,
-    memory_gauge, param_tabs, param_row, path_row, state_status, status_dot, terminal, PathPick,
-    GaugeSegment,
+    self, cli_preview, card, card_titled, format_size, gauge_color, memory_gauge, param_tabs,
+    param_row, path_row, state_status, status_dot, PathPick, GaugeSegment,
 };
 
 const KV_CACHE_COLOR: Color32 = Color32::from_rgb(0x81, 0x8C, 0xF8);
@@ -26,10 +25,6 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     params_card(app, ui);
     ui.add_space(10.0);
     cli_card(app, ui);
-    ui.add_space(10.0);
-    server_log_card(app, ui);
-    ui.add_space(10.0);
-    app_log_card(app, ui);
 }
 
 /// Верхний статус-баннер: крупный статус + адрес и быстрые действия.
@@ -47,11 +42,11 @@ fn hero_card(app: &mut App, ui: &mut egui::Ui) {
             ui.label(RichText::new(hint).size(13.0).color(MUTED));
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ready && ui.button("🌐 Веб-интерфейс").clicked() {
+                if ready && ui.button("Веб-интерфейс").clicked() {
                     ui::open_url(&url);
                 }
                 if ready
-                    && ui.button("⧉ Копировать URL").on_hover_text("Скопировать адрес API").clicked()
+                    && ui.button("Копировать URL").on_hover_text("Скопировать адрес API").clicked()
                 {
                     ui.ctx().copy_text(url.clone());
                 }
@@ -93,7 +88,7 @@ fn presets_toolbar(app: &mut App, ui: &mut egui::Ui) {
                     }
                 });
             if ui
-                .add_enabled(has_selection, egui::Button::new("💾"))
+                .add_enabled(has_selection, egui::Button::new("Сохранить"))
                 .on_hover_text("Сохранить текущую конфигурацию в выбранный пресет")
                 .clicked()
             {
@@ -101,7 +96,7 @@ fn presets_toolbar(app: &mut App, ui: &mut egui::Ui) {
             }
             let name_differs = has_selection && selection.as_deref() != Some(typed_name.as_str());
             if ui
-                .add_enabled(name_differs, egui::Button::new("✏"))
+                .add_enabled(name_differs, egui::Button::new("Переименовать"))
                 .on_hover_text(format!(
                     "Переименовать «{}» в «{typed_name}»",
                     selection.as_deref().unwrap_or("")
@@ -111,7 +106,7 @@ fn presets_toolbar(app: &mut App, ui: &mut egui::Ui) {
                 app.preset_delete_armed = false;
                 app.rename_selected_preset();
             }
-            let delete_label = if app.preset_delete_armed { "Точно удалить?" } else { "🗑" };
+            let delete_label = if app.preset_delete_armed { "Точно удалить?" } else { "Удалить" };
             if ui
                 .add_enabled(has_selection, egui::Button::new(delete_label))
                 .on_hover_text("Второй щелчок подтверждает удаление")
@@ -124,10 +119,10 @@ fn presets_toolbar(app: &mut App, ui: &mut egui::Ui) {
                     app.preset_delete_armed = true;
                 }
             }
-            if ui.button("⤓").on_hover_text("Экспорт пресета в JSON-файл").clicked() {
+            if ui.button("Экспорт…").on_hover_text("Экспорт пресета в JSON-файл").clicked() {
                 app.export_selected_preset();
             }
-            if ui.button("⤒").on_hover_text("Импорт пресета из JSON-файла").clicked() {
+            if ui.button("Импорт…").on_hover_text("Импорт пресета из JSON-файла").clicked() {
                 app.import_preset_file();
             }
             if has_selection {
@@ -346,9 +341,10 @@ fn params_card(app: &mut App, ui: &mut egui::Ui) {
             .cloned()
             .collect();
 
+        let local_models = crate::app::library_models(&app.settings.models_dir);
         let mut params_changed = false;
         for def in &defs {
-            params_changed |= param_row(ui, def, &mut app.settings.params);
+            params_changed |= param_row(ui, def, &mut app.settings.params, &local_models);
         }
         if params_changed {
             app.mark_dirty();
@@ -377,108 +373,5 @@ fn cli_card(app: &mut App, ui: &mut egui::Ui) {
             .to_config(app.build_extra_args())
             .command_line();
         cli_preview(ui, &command);
-    });
-}
-
-/// Журнал llama-server: терминал с автопрокруткой.
-fn server_log_card(app: &mut App, ui: &mut egui::Ui) {
-    card_titled(ui, "Журнал llama-server", |ui| {
-        ui.horizontal(|ui| {
-            if ui.small_button("Сохранить в файл…").clicked() {
-                app.save_server_log();
-            }
-            if ui.small_button("Очистить").clicked()
-                && let Ok(mut log) = app.server.server_log().lock()
-            {
-                log.clear();
-            }
-        });
-        ui.add_space(4.0);
-        let lines: Vec<String> = app
-            .server
-            .server_log()
-            .lock()
-            .map(|log| {
-                log.lines()
-                    .iter()
-                    .map(|(time, line)| format!("{} {}", time.format("%H:%M:%S"), line))
-                    .collect()
-            })
-            .unwrap_or_default();
-        ScrollArea::vertical()
-            .id_salt("server_log")
-            .stick_to_bottom(true)
-            .max_height(240.0)
-            .show(ui, |ui| {
-                let colored: Vec<(String, Color32)> = lines
-                    .iter()
-                    .map(|line| (line.clone(), line_color(line)))
-                    .collect();
-                terminal(ui, &colored, "нет вывода процесса");
-            });
-    });
-}
-
-/// Журнал приложения с фильтром уровней.
-fn app_log_card(app: &mut App, ui: &mut egui::Ui) {
-    let Some(handle) = app.log_handle.clone() else {
-        return;
-    };
-    card_titled(ui, "Журнал приложения", |ui| {
-        ui.horizontal(|ui| {
-            ui.style_mut().spacing.item_spacing.x = 6.0;
-            for (i, name) in ["INFO", "WARN", "ERROR", "DEBUG"].iter().enumerate() {
-                let color = match i {
-                    1 => theme::WARN_YELLOW,
-                    2 => theme::ERR_RED,
-                    _ => MUTED,
-                };
-                let on = &mut app.log_filter[i];
-                ui.toggle_value(on, RichText::new(*name).size(11.0).strong().color(if *on { color } else { MUTED }));
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("Открыть папку логов").clicked() {
-                    ui::open_folder(&app.settings.logs_dir);
-                }
-                if ui.small_button("Очистить").clicked() {
-                    handle.clear();
-                }
-            });
-        });
-        ui.add_space(4.0);
-        let filter = app.log_filter;
-        let entries: Vec<crate::logger::LogEntry> = handle
-            .snapshot()
-            .into_iter()
-            .filter(|entry| {
-                match entry.level {
-                    log::Level::Info => filter[0],
-                    log::Level::Warn => filter[1],
-                    log::Level::Error => filter[2],
-                    log::Level::Debug | log::Level::Trace => filter[3],
-                }
-            })
-            .collect();
-        ScrollArea::vertical()
-            .id_salt("app_log")
-            .stick_to_bottom(true)
-            .max_height(200.0)
-            .show(ui, |ui| {
-                let colored: Vec<(String, Color32)> = entries
-                    .iter()
-                    .map(|entry| {
-                        (
-                            format!(
-                                "{} {:<5} {}",
-                                entry.time.format("%H:%M:%S"),
-                                entry.level,
-                                entry.message
-                            ),
-                            level_color(entry.level),
-                        )
-                    })
-                    .collect();
-                terminal(ui, &colored, "журнал пуст");
-            });
     });
 }

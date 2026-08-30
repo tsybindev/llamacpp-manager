@@ -186,7 +186,7 @@ fn search_card(app: &mut App, ui: &mut egui::Ui) {
                         .column(Column::auto().at_least(80.0))
                         .column(Column::auto().at_least(60.0))
                         .header(22.0, |mut header| {
-                            for name in ["Репозиторий", "⬇ Скачиваний", "★ Звёзд"] {
+                            for name in ["Репозиторий", "Скачиваний", "Звёзд"] {
                                 header.col(|ui| {
                                     ui.label(RichText::new(name).size(12.0).strong().color(MUTED));
                                 });
@@ -324,7 +324,13 @@ fn files_card(app: &mut App, ui: &mut egui::Ui) {
                         row.col(|ui| {
                             ui.horizontal(|ui| {
                                 if downloading {
-                                    ui.label(RichText::new("⏳ идёт загрузка").size(12.0).color(MUTED));
+                                    if ui
+                                        .button("Отменить")
+                                        .on_hover_text("Остановить скачивание (частичный файл сохранится и докачается позже)")
+                                        .clicked()
+                                    {
+                                        app.cancel_model_download();
+                                    }
                                 } else if let Some(download) = app.model_download.as_ref()
                                     && download.error.is_some()
                                     && download.path == file.path
@@ -332,7 +338,7 @@ fn files_card(app: &mut App, ui: &mut egui::Ui) {
                                 {
                                     clear_download = true;
                                 } else if ui
-                                    .add_enabled(!busy, egui::Button::new(if downloaded { "Перекачать" } else { "⬇ Скачать" }))
+                                    .add_enabled(!busy, egui::Button::new(if downloaded { "Перекачать" } else { "Скачать" }))
                                     .on_hover_text(format!(
                                         "{} в {}\n{}",
                                         if downloaded { "Скачать заново" } else { "Скачать" },

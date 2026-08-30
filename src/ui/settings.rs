@@ -62,7 +62,7 @@ fn hf_card(app: &mut App, ui: &mut egui::Ui) {
                 app.settings.hf_token = token.trim().to_string();
                 app.mark_dirty();
             }
-            let toggle_label = if app.hf_show_token { "🙈 Скрыть" } else { "👁 Показать" };
+            let toggle_label = if app.hf_show_token { "Скрыть" } else { "Показать" };
             if ui.button(toggle_label).clicked() {
                 app.hf_show_token = !app.hf_show_token;
             }

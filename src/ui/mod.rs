@@ -3,6 +3,7 @@
 //! [`builds`] и [`settings`].
 
 pub mod builds;
+pub mod logs;
 pub mod models;
 pub mod server;
 pub mod settings;
@@ -130,8 +131,9 @@ pub fn state_status(state: ServerState) -> (Color32, &'static str) {
 // Навигация (sidebar)
 // ---------------------------------------------------------------------------
 
-/// Полноширинная кнопка навигации с иконкой и левым выравниванием.
-pub fn nav_item(ui: &mut Ui, selected: bool, icon: &str, label: &str) -> egui::Response {
+/// Полноширинная кнопка навигации с левым выравниванием (текстовая —
+/// часть глифов в дефолтном шрифте egui не покрывается).
+pub fn nav_item(ui: &mut Ui, selected: bool, label: &str) -> egui::Response {
     let height = 30.0;
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
@@ -145,25 +147,24 @@ pub fn nav_item(ui: &mut Ui, selected: bool, icon: &str, label: &str) -> egui::R
         ui.painter()
             .rect_filled(rect.expand2(Vec2::new(4.0, 1.0)), RADIUS_WIDGET, bg);
     }
-    let icon_color = if selected { theme::ACCENT } else { MUTED };
     let text_color = if selected {
         Color32::from_rgb(0xE2, 0xE7, 0xF0)
     } else {
         MUTED
     };
-    let font = egui::FontId::proportional(14.0);
+    if selected {
+        // Акцентная полоска слева у активного пункта.
+        let bar = egui::Rect::from_min_size(
+            egui::Pos2::new(rect.left() + 2.0, rect.top() + 3.0),
+            Vec2::new(3.0, rect.height() - 6.0),
+        );
+        ui.painter().rect_filled(bar, 2.0, theme::ACCENT);
+    }
     ui.painter().text(
-        egui::Pos2::new(rect.left() + 12.0, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        icon,
-        font.clone(),
-        icon_color,
-    );
-    ui.painter().text(
-        egui::Pos2::new(rect.left() + 36.0, rect.center().y),
+        egui::Pos2::new(rect.left() + 16.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
-        font,
+        egui::FontId::proportional(14.0),
         text_color,
     );
     response.on_hover_text(label)
@@ -219,7 +220,7 @@ pub fn cli_preview(ui: &mut Ui, command: &str) {
     ui.horizontal(|ui| {
         section_label(ui, "Команда запуска");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("⧉ Копировать").on_hover_text("Скопировать команду в буфер обмена").clicked() {
+            if ui.button("Копировать").on_hover_text("Скопировать команду в буфер обмена").clicked() {
                 ui.ctx().copy_text(command.to_string());
             }
         });
@@ -357,8 +358,15 @@ pub fn path_row(ui: &mut Ui, label: &str, path: &mut PathBuf, hint: &str, pick: 
     changed
 }
 
-/// Строка параметра: `☑ Название 🛈 | виджет ввода`. Возвращает true при изменении.
-pub fn param_row(ui: &mut Ui, def: &ParamDef, state: &mut ParamState) -> bool {
+/// Строка параметра: `☑ Название 🛈 | виджет ввода`. Для Path-параметров
+/// дополнительно доступны выпадающий список локальных моделей (`local_models`)
+/// и кнопка «Обзор…». Возвращает true при изменении.
+pub fn param_row(
+    ui: &mut Ui,
+    def: &ParamDef,
+    state: &mut ParamState,
+    local_models: &[PathBuf],
+) -> bool {
     let before = state.clone();
     let mut tooltip = format!("{}\n\nФлаг: {}", def.description, def.flag);
     if let Some(short) = &def.short {
@@ -442,13 +450,71 @@ pub fn param_row(ui: &mut Ui, def: &ParamDef, state: &mut ParamState) -> bool {
                         }
                     }
                     ParamKind::Path => {
-                        let mut text = value.as_ref().and_then(|x| x.as_str()).unwrap_or_default().to_string();
-                        let edit_width = (field_width - BROWSE_BUTTON_WIDTH).clamp(120.0, 400.0);
-                        if ui.add(TextEdit::singleline(&mut text).desired_width(edit_width).font(egui::TextStyle::Monospace)).on_hover_text(&tooltip).changed() {
-                            Some(serde_json::json!(text.trim()))
-                        } else {
-                            None
+                        let mut text = value
+                            .as_ref()
+                            .and_then(|x| x.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        let before = text.clone();
+                        let mut picked: Option<serde_json::Value> = None;
+                        let extras_width = if local_models.is_empty() { 0.0 } else { 130.0 };
+                        let edit_width =
+                            (field_width - BROWSE_BUTTON_WIDTH - extras_width).clamp(120.0, 400.0);
+                        if ui
+                            .add(
+                                TextEdit::singleline(&mut text)
+                                    .desired_width(edit_width)
+                                    .font(egui::TextStyle::Monospace),
+                            )
+                            .on_hover_text(&tooltip)
+                            .changed()
+                        {
+                            picked = Some(serde_json::json!(text.trim()));
                         }
+                        if !local_models.is_empty() {
+                            // Выбор из библиотеки моделей: в значение
+                            // записывается полный путь, показывается имя файла.
+                            let selected_name = std::path::Path::new(text.trim())
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("")
+                                .to_string();
+                            egui::ComboBox::from_id_salt(format!("path-select-{}", def.id))
+                                .selected_text(if selected_name.is_empty() {
+                                    "из библиотеки…".to_string()
+                                } else {
+                                    selected_name
+                                })
+                                .width(120.0)
+                                .show_ui(ui, |ui| {
+                                    for model in local_models {
+                                        let name = model
+                                            .file_name()
+                                            .and_then(|n| n.to_str())
+                                            .unwrap_or_default()
+                                            .to_string();
+                                        ui.selectable_value(
+                                            &mut text,
+                                            model.display().to_string(),
+                                            name,
+                                        )
+                                        .on_hover_text(model.display().to_string());
+                                    }
+                                })
+                                .response
+                                .on_hover_text(&tooltip);
+                            if text != before {
+                                picked = Some(serde_json::json!(text.trim()));
+                            }
+                        }
+                        if ui.button("Обзор…").clicked()
+                            && let Some(file) = rfd::FileDialog::new()
+                                .set_title(format!("Выберите: {}", def.name))
+                                .pick_file()
+                        {
+                            picked = Some(serde_json::json!(file.display().to_string()));
+                        }
+                        picked
                     }
                     ParamKind::Bool => None,
                 };

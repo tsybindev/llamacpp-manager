@@ -1,8 +1,10 @@
-//! Общее потоковое скачивание файлов по HTTP: прогресс, докачка (Range).
+//! Общее потоковое скачивание файлов по HTTP: прогресс, докачка (Range), отмена.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -12,6 +14,24 @@ const CHUNK: usize = 64 * 1024;
 /// Промежуточные отчёты прогресса не чаще раза в мегабайт.
 const PROGRESS_STEP: u64 = 1024 * 1024;
 
+/// Общий флаг отмены для фонового скачивания.
+#[derive(Clone, Default)]
+pub struct CancelFlag(Arc<AtomicBool>);
+
+impl CancelFlag {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
 /// Параметры скачивания файла.
 pub struct DownloadRequest {
     pub url: String,
@@ -20,6 +40,8 @@ pub struct DownloadRequest {
     pub headers: Vec<(String, String)>,
     /// Докачивать частично скачанный файл через Range-запрос.
     pub resume: bool,
+    /// Флаг отмены: частичный файл сохраняется для последующей докачки.
+    pub cancel: CancelFlag,
 }
 
 /// Размер файла на сервере через HEAD-запрос (для проверки докачки).
@@ -85,6 +107,7 @@ pub fn download_file(request: &DownloadRequest, mut progress: impl FnMut(u64, u6
                 dest: request.dest.clone(),
                 headers: request.headers.clone(),
                 resume: false,
+                cancel: request.cancel.clone(),
             },
             progress,
         );
@@ -129,6 +152,10 @@ pub fn download_file(request: &DownloadRequest, mut progress: impl FnMut(u64, u6
     let mut last_reported = start;
     let mut chunk = [0u8; CHUNK];
     loop {
+        if request.cancel.is_cancelled() {
+            // Частичный файл оставляем на диске — resume докачает с этого места.
+            return Err(anyhow::anyhow!("скачивание отменено"));
+        }
         let read = reader.read(&mut chunk).context("чтение тела ответа")?;
         if read == 0 {
             break;

@@ -149,6 +149,7 @@ impl BuildsStore {
     pub fn install(
         &self,
         asset: &BuildAsset,
+        cancel: crate::download::CancelFlag,
         mut progress: impl FnMut(Progress),
     ) -> Result<InstalledBuild> {
         fs::create_dir_all(&self.dir)
@@ -158,6 +159,7 @@ impl BuildsStore {
         download_file(
             &asset.asset.browser_download_url,
             &main_path,
+            cancel.clone(),
             |d, t| progress(Progress::Downloading { downloaded: d, total: t }),
         )
         .with_context(|| format!("скачивание {}", asset.asset.name))?;
@@ -165,8 +167,11 @@ impl BuildsStore {
         // cudart-рантайм нужен Windows CUDA сборкам (отдельный архив в релизе).
         let runtime_path = match &asset.runtime_asset {
             Some(runtime) => {
+                if cancel.is_cancelled() {
+                    return Err(anyhow::anyhow!("скачивание отменено"));
+                }
                 let path = self.dir.join(format!(".download-{}", runtime.name));
-                download_file(&runtime.browser_download_url, &path, |_, _| {})
+                download_file(&runtime.browser_download_url, &path, cancel.clone(), |_, _| {})
                     .with_context(|| format!("скачивание {}", runtime.name))?;
                 Some(path)
             }
@@ -188,6 +193,7 @@ impl BuildsStore {
 pub fn download_file(
     url: &str,
     dest: &Path,
+    cancel: crate::download::CancelFlag,
     progress: impl FnMut(u64, u64),
 ) -> Result<()> {
     crate::download::download_file(
@@ -196,6 +202,7 @@ pub fn download_file(
             dest: dest.to_path_buf(),
             headers: vec![("User-Agent".to_string(), USER_AGENT.to_string())],
             resume: false,
+            cancel,
         },
         progress,
     )
@@ -564,6 +571,7 @@ mod tests {
         download_file(
             "https://raw.githubusercontent.com/tsybindev/llamacpp-manager/main/assets/params_catalog.json",
             &dest,
+            crate::download::CancelFlag::new(),
             |downloaded, total| {
                 total_seen = total;
                 assert!(downloaded <= total.max(1));

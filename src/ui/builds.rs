@@ -95,7 +95,7 @@ fn installed_card(app: &mut App, ui: &mut egui::Ui) {
                 match &binary {
                     Some(bin) => {
                         ui.label(
-                            RichText::new(format!("📂 {}", short_path(bin, 4)))
+                            RichText::new(short_path(bin, 4))
                                 .monospace()
                                 .size(11.0)
                                 .color(MUTED),
@@ -128,7 +128,7 @@ fn releases_card(app: &mut App, ui: &mut egui::Ui) {
     card_titled(ui, "Доступные релизы (GitHub)", |ui| {
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(!app.build_releases_loading, egui::Button::new("⟳ Обновить"))
+                .add_enabled(!app.build_releases_loading, egui::Button::new("Обновить"))
                 .clicked()
             {
                 app.start_builds_refresh(true);
@@ -232,7 +232,7 @@ fn releases_card(app: &mut App, ui: &mut egui::Ui) {
                                 ui.label(RichText::new(&asset.name).monospace().size(11.0));
                                 ui.label(RichText::new(format_size(asset.size)).size(11.0).color(MUTED));
                                 if ui
-                                    .add_enabled(!app.is_downloading(&asset.name), egui::Button::new("⬇ Скачать").small())
+                                    .add_enabled(!app.is_downloading(&asset.name), egui::Button::new("Скачать").small())
                                     .on_hover_text(format!("Релиз {tag}\n{}", asset.browser_download_url))
                                     .clicked()
                                 {
@@ -297,7 +297,7 @@ fn assets_table(
                         }
                     });
                     row.col(|ui| {
-                        let label = if already_installed { "⤓ Заменить" } else { "⬇ Скачать" };
+                        let label = if already_installed { "Заменить" } else { "Скачать" };
                         if ui
                             .add_enabled(!app.is_downloading(&asset.asset.name), egui::Button::new(label).small())
                             .on_hover_text(format!(
@@ -329,26 +329,40 @@ fn first_visible_tag(assets: &[github::BuildAsset]) -> String {
 /// Панель прогресса текущего скачивания сборки.
 fn download_panel(app: &mut App, ui: &mut egui::Ui) {
     let mut clear_download = false;
+    let mut cancel_download = false;
     if let Some(download) = app.build_download.as_mut() {
+        let (name, error, extracting, downloaded, total) = (
+            download.asset.asset.name.clone(),
+            download.error.clone(),
+            download.extracting,
+            download.downloaded,
+            download.total,
+        );
         ui::card(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(&download.asset.asset.name).monospace().size(12.0).strong());
-                if let Some(error) = &download.error {
+                ui.label(RichText::new(&name).monospace().size(12.0).strong());
+                if let Some(error) = &error {
                     ui.label(RichText::new(error).size(12.0).color(theme::ERR_RED));
                     if ui.small_button("Скрыть").clicked() {
                         clear_download = true;
                     }
+                } else if ui
+                    .small_button("Отменить")
+                    .on_hover_text("Остановить скачивание")
+                    .clicked()
+                {
+                    cancel_download = true;
                 }
             });
-            if download.error.is_none() {
-                if download.extracting {
+            if error.is_none() {
+                if extracting {
                     ui.horizontal(|ui| {
                         ui.add(egui::Spinner::new().size(14.0));
                         ui.label(RichText::new("Распаковка архива…").size(13.0).color(MUTED));
                     });
                 } else {
-                    let fraction = if download.total > 0 {
-                        download.downloaded as f32 / download.total as f32
+                    let fraction = if total > 0 {
+                        downloaded as f32 / total as f32
                     } else {
                         0.0
                     };
@@ -357,19 +371,22 @@ fn download_panel(app: &mut App, ui: &mut egui::Ui) {
                             .show_percentage()
                             .desired_width(ui.available_width()),
                     );
-                    let total = if download.total > 0 {
-                        format_size(download.total)
+                    let total_label = if total > 0 {
+                        format_size(total)
                     } else {
                         "?".to_string()
                     };
                     ui.label(
-                        RichText::new(format!("{} из {}", format_size(download.downloaded), total))
+                        RichText::new(format!("{} из {}", format_size(downloaded), total_label))
                             .size(11.0)
                             .color(MUTED),
                     );
                 }
             }
         });
+    }
+    if cancel_download {
+        app.cancel_build_download();
     }
     if clear_download {
         app.build_download = None;
