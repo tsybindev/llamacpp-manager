@@ -3,6 +3,7 @@ mod builds;
 mod config;
 mod download;
 mod github;
+mod gguf;
 mod huggingface;
 mod logger;
 mod params;

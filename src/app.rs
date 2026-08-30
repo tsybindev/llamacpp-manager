@@ -7,6 +7,7 @@ use egui::{Color32, RichText, ScrollArea};
 use crate::builds;
 use crate::config::{self, Settings};
 use crate::github;
+use crate::gguf;
 use crate::huggingface;
 use crate::logger::{self, LogHandle, LogEntry};
 use crate::params::{self, ParamDef, ParamKind, ParamsCatalog, ParamState};
@@ -103,6 +104,8 @@ pub struct App {
     hf_error: Option<String>,
     /// Текущее скачивание файла модели, если идёт.
     model_download: Option<ModelDownload>,
+    /// Кэш прочитанного GGUF-заголовка для текущего пути модели.
+    model_info_cache: Option<(PathBuf, Option<gguf::GgufInfo>)>,
     /// Fresh catalog fetched in the background, picked up on the next frame.
     catalog_refresh: std::sync::Arc<std::sync::Mutex<Option<ParamsCatalog>>>,
 }
@@ -273,6 +276,7 @@ impl App {
             hf_files_rx: None,
             hf_error: None,
             model_download: None,
+            model_info_cache: None,
             catalog_refresh,
             settings,
             applied_theme: None,
@@ -906,6 +910,7 @@ impl App {
                     .changed();
             });
         }
+        self.memory_estimate_section(ui);
 
         if self.server_form.host.trim() == "0.0.0.0" {
             ui.label(
@@ -1919,6 +1924,159 @@ impl App {
         if succeeded {
             self.build_download = None;
         }
+    }
+
+    /// Прочитать GGUF-заголовок текущей модели (с кэшем по пути).
+    fn cached_gguf_info(&mut self) -> Option<(PathBuf, Option<gguf::GgufInfo>)> {
+        let path = self.server_form.model.clone();
+        if path.as_os_str().is_empty() {
+            return None;
+        }
+        if self
+            .model_info_cache
+            .as_ref()
+            .is_some_and(|(cached, _)| *cached == path)
+        {
+            return self
+                .model_info_cache
+                .as_ref()
+                .map(|(p, info)| (p.clone(), info.clone()));
+        }
+        let info = if path.is_file() {
+            match gguf::read_header(&path) {
+                Ok(info) => Some(info),
+                Err(e) => {
+                    log::debug!("GGUF-заголовок {}: {e:#}", path.display());
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        self.model_info_cache = Some((path.clone(), info.clone()));
+        Some((path, info))
+    }
+
+    fn param_u64(&self, id: &str) -> Option<u64> {
+        if !self.settings.params.is_enabled(id) {
+            return None;
+        }
+        self.settings
+            .params
+            .entries
+            .get(id)
+            .and_then(|e| e.value.as_ref())
+            .and_then(|v| v.as_i64())
+            .map(|v| v.max(0) as u64)
+    }
+
+    fn param_string(&self, id: &str) -> Option<String> {
+        if !self.settings.params.is_enabled(id) {
+            return None;
+        }
+        self.settings
+            .params
+            .entries
+            .get(id)
+            .and_then(|e| e.value.as_ref())
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    }
+
+    /// Контекст из параметров сервера (если включён).
+    fn ctx_from_params(&self) -> Option<u64> {
+        self.param_u64("ctx-size")
+    }
+
+    /// Байт на элемент KV-кэша с учётом cache-type-k/v (по половине кэша на K и V).
+    fn kv_elem_bytes(&self) -> f64 {
+        let cache_type_bytes = |id: &str| match self.param_string(id).as_deref() {
+            Some(t) if t.eq_ignore_ascii_case("q8_0") => 1.0,
+            Some(t) if t.eq_ignore_ascii_case("q4_0") => 0.5,
+            _ => 2.0, // f16 по умолчанию
+        };
+        (cache_type_bytes("cache-type-k") + cache_type_bytes("cache-type-v")) / 2.0
+    }
+
+    /// Оценка памяти для текущей модели: (модель, оценка).
+    fn memory_estimate(&mut self) -> Option<(gguf::GgufInfo, gguf::MemoryEstimate)> {
+        let (path, info) = self.cached_gguf_info()?;
+        let info = info?;
+        let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let gpu_offload_all = self
+            .param_u64("ngl")
+            .is_some_and(|ngl| info.n_layers.is_some_and(|layers| ngl >= layers) || ngl >= 999);
+        let estimate =
+            gguf::estimate_memory(&info, file_size, self.ctx_from_params(), self.kv_elem_bytes(), gpu_offload_all)?;
+        Some((info, estimate))
+    }
+
+    /// Строка метаданных GGUF и цветная оценка памяти под путём модели.
+    fn memory_estimate_section(&mut self, ui: &mut egui::Ui) {
+        let Some((path, info)) = self.cached_gguf_info() else {
+            return;
+        };
+        let Some(info) = info else {
+            if path.is_file() {
+                ui.label(
+                    RichText::new("Не удалось прочитать GGUF-заголовок — оценка памяти недоступна")
+                        .small()
+                        .color(theme::WARN_YELLOW),
+                );
+            }
+            return;
+        };
+
+        let quant = info
+            .file_type
+            .and_then(gguf::file_type_label)
+            .map(str::to_string)
+            .or_else(|| {
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(huggingface::quant_from_filename)
+            });
+        let mut meta = format!(
+            "{} · {} слоёв{}",
+            info.arch.as_deref().unwrap_or("gguf"),
+            info.n_layers.map_or("?".into(), |l| l.to_string()),
+            quant.map_or(String::new(), |q| format!(" · {q}"))
+        );
+        if let Some(train_ctx) = info.ctx_train {
+            meta.push_str(&format!(" · контекст до {train_ctx}"));
+        }
+        ui.label(RichText::new(meta).small().weak());
+
+        let Some((_, estimate)) = self.memory_estimate() else {
+            return;
+        };
+        const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+        let total_gb = estimate.weights_bytes as f64 + estimate.kv_cache_bytes as f64;
+        let color = if total_gb >= 16.0 * GB {
+            theme::ERR_RED
+        } else if total_gb >= 8.0 * GB {
+            theme::WARN_YELLOW
+        } else {
+            theme::OK_GREEN
+        };
+        let note = if estimate.gpu_bytes >= total_gb as u64 {
+            "вся модель на GPU"
+        } else if estimate.gpu_bytes > 0 {
+            "частично на GPU"
+        } else {
+            "только CPU/RAM"
+        };
+        ui.label(
+            RichText::new(format!(
+                "Оценка памяти: веса {} + KV-кэш {} (ctx {}) ≈ {} — {note} · приблизительно",
+                format_size(estimate.weights_bytes),
+                format_size(estimate.kv_cache_bytes),
+                estimate.ctx_used,
+                format_size(total_gb as u64),
+            ))
+            .small()
+            .color(color),
+        );
     }
 
     /// Сделать llama-server из установленной сборки активным бинарником.
