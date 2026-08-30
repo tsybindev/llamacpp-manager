@@ -918,16 +918,18 @@ fn path_row(ui: &mut egui::Ui, label: &str, path: &mut PathBuf, hint: &str, pick
             *path = PathBuf::from(text.trim());
             changed = true;
         }
-        let dialog = rfd::FileDialog::new().set_title(format!("Выберите: {label}"));
-        let picked = match pick {
-            PathPick::File => dialog.pick_file(),
-            PathPick::Folder => dialog.pick_folder(),
-        };
-        if ui.button("Обзор…").clicked()
-            && let Some(new_path) = picked
-        {
-            *path = new_path;
-            changed = true;
+        if ui.button("Обзор…").clicked() {
+            // The dialog must be created and awaited only on click —
+            // pick_file/pick_folder are blocking calls.
+            let dialog = rfd::FileDialog::new().set_title(format!("Выберите: {label}"));
+            let picked = match pick {
+                PathPick::File => dialog.pick_file(),
+                PathPick::Folder => dialog.pick_folder(),
+            };
+            if let Some(new_path) = picked {
+                *path = new_path;
+                changed = true;
+            }
         }
     });
     changed
