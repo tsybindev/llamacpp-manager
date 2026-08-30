@@ -58,26 +58,30 @@ fn installed_card(app: &mut App, ui: &mut egui::Ui) {
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let armed = app.build_delete_armed.as_deref() == Some(build.dir.as_path());
-                        let label = if armed { "Точно удалить?" } else { "Удалить" };
-                        let response = ui
-                            .button(label)
-                            .on_hover_text(format!("Удалить каталог сборки\n{}", build.dir.display()));
-                        let mut warn = String::new();
                         if armed {
                             let affected = app.presets_using_dir(&build.dir);
-                            if !affected.is_empty() {
-                                warn = format!(
+                            let warning = if affected.is_empty() {
+                                None
+                            } else {
+                                Some(format!(
                                     "используется в пресетах: {} — их настройка бинарника станет нерабочей",
                                     affected.join(", ")
-                                );
+                                ))
+                            };
+                            match ui::delete_confirm(ui, warning.as_deref()) {
+                                Some(true) => {
+                                    delete = Some(build.clone());
+                                    app.build_delete_armed = None;
+                                }
+                                Some(false) => app.build_delete_armed = None,
+                                None => {}
                             }
-                        }
-                        if response.clicked() {
-                            if armed {
-                                delete = Some(build.clone());
-                            } else {
-                                app.build_delete_armed = Some(build.dir.clone());
-                            }
+                        } else if ui
+                            .button("Удалить")
+                            .on_hover_text(format!("Удалить каталог сборки\n{}", build.dir.display()))
+                            .clicked()
+                        {
+                            app.build_delete_armed = Some(build.dir.clone());
                         }
                         if ui
                             .add_enabled(binary.is_some() && !is_active, egui::Button::new("Сделать активной"))
@@ -86,9 +90,6 @@ fn installed_card(app: &mut App, ui: &mut egui::Ui) {
                             && let Some(bin) = &binary
                         {
                             activate = Some((build.tag.clone(), bin.clone()));
-                        }
-                        if !warn.is_empty() {
-                            ui.label(RichText::new(format!("⚠ {warn}")).size(11.0).color(theme::WARN_YELLOW));
                         }
                     });
                 });

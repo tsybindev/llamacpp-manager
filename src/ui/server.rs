@@ -106,18 +106,22 @@ fn presets_toolbar(app: &mut App, ui: &mut egui::Ui) {
                 app.preset_delete_armed = false;
                 app.rename_selected_preset();
             }
-            let delete_label = if app.preset_delete_armed { "Точно удалить?" } else { "Удалить" };
-            if ui
-                .add_enabled(has_selection, egui::Button::new(delete_label))
-                .on_hover_text("Второй щелчок подтверждает удаление")
+            if app.preset_delete_armed && has_selection {
+                let name = selection.clone().unwrap_or_default();
+                match ui::delete_confirm(ui, Some(&format!("Пресет «{name}» будет удалён с диска"))) {
+                    Some(true) => {
+                        app.delete_selected_preset();
+                        app.preset_delete_armed = false;
+                    }
+                    Some(false) => app.preset_delete_armed = false,
+                    None => {}
+                }
+            } else if ui
+                .add_enabled(has_selection, egui::Button::new("Удалить"))
+                .on_hover_text("Удалить выбранный пресет с диска")
                 .clicked()
             {
-                if app.preset_delete_armed {
-                    app.delete_selected_preset();
-                    app.preset_delete_armed = false;
-                } else {
-                    app.preset_delete_armed = true;
-                }
+                app.preset_delete_armed = true;
             }
             if ui.button("Экспорт…").on_hover_text("Экспорт пресета в JSON-файл").clicked() {
                 app.export_selected_preset();

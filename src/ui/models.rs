@@ -105,27 +105,30 @@ fn library_card(app: &mut App, ui: &mut egui::Ui) {
                                     activate = Some(path.clone());
                                 }
                                 let armed = app.model_delete_armed.as_deref() == Some(path.as_path());
-                                let label = if armed { "Точно удалить?" } else { "Удалить" };
-                                if ui
-                                    .button(label)
+                                if armed {
+                                    let affected = app.presets_using_model(&path);
+                                    let warning = if affected.is_empty() {
+                                        None
+                                    } else {
+                                        Some(format!(
+                                            "используется в пресетах: {} — настройка модели станет нерабочей",
+                                            affected.join(", ")
+                                        ))
+                                    };
+                                    match ui::delete_confirm(ui, warning.as_deref()) {
+                                        Some(true) => {
+                                            delete = Some(path.clone());
+                                            app.model_delete_armed = None;
+                                        }
+                                        Some(false) => app.model_delete_armed = None,
+                                        None => {}
+                                    }
+                                } else if ui
+                                    .button("Удалить")
                                     .on_hover_text(format!("Удалить файл с диска\n{}", path.display()))
                                     .clicked()
                                 {
-                                    if armed {
-                                        delete = Some(path.clone());
-                                    } else {
-                                        app.model_delete_armed = Some(path.clone());
-                                    }
-                                }
-                                if armed {
-                                    let affected = app.presets_using_model(&path);
-                                    if !affected.is_empty() {
-                                        ui.label(
-                                            RichText::new(format!("⚠ используется в пресетах: {}", affected.join(", ")))
-                                                .size(11.0)
-                                                .color(theme::WARN_YELLOW),
-                                        );
-                                    }
+                                    app.model_delete_armed = Some(path.clone());
                                 }
                             });
                         });

@@ -171,6 +171,45 @@ pub fn nav_item(ui: &mut Ui, selected: bool, label: &str) -> egui::Response {
 }
 
 // ---------------------------------------------------------------------------
+// Подтверждение удаления
+// ---------------------------------------------------------------------------
+
+/// Инлайн-подтверждение удаления с выбором «Да, удалить» / «Отмена».
+/// Возвращает `Some(true)` — подтверждено, `Some(false)` — отмена,
+/// `None` — пользователь ещё не ответил. `warning` — предупреждение
+/// о последствиях (например, «используется в пресетах: …»).
+pub fn delete_confirm(ui: &mut Ui, warning: Option<&str>) -> Option<bool> {
+    let mut result: Option<bool> = None;
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("Удалить безвозвратно?")
+                .size(12.0)
+                .strong()
+                .color(theme::WARN_YELLOW),
+        );
+        let yes = egui::Button::new(
+            RichText::new("Да, удалить").size(12.5).strong().color(theme::ERR_RED),
+        )
+        .fill(theme::ERR_RED.linear_multiply(0.16))
+        .stroke(Stroke::new(1.0, theme::ERR_RED.linear_multiply(0.6)));
+        if ui
+            .add(yes)
+            .on_hover_text("Действие нельзя отменить")
+            .clicked()
+        {
+            result = Some(true);
+        }
+        if ui.small_button("Отмена").clicked() {
+            result = Some(false);
+        }
+        if let Some(warning) = warning {
+            ui.label(RichText::new(warning).size(11.0).color(theme::WARN_YELLOW));
+        }
+    });
+    result
+}
+
+// ---------------------------------------------------------------------------
 // Терминал логов и CLI-предпросмотр
 // ---------------------------------------------------------------------------
 
