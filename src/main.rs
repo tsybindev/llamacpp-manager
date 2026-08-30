@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod github;
 mod logger;
 mod params;
 mod presets;
