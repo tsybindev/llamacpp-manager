@@ -410,15 +410,37 @@ impl App {
             self.selected_preset = None;
             self.preset_delete_armed = false;
         }
-        // Sync the name field whenever the combo box selection changes,
-        // and remember the selection for the next session.
+        // When the selection changes: remember it and load the preset right
+        // away, so the form always mirrors the selected preset. Otherwise the
+        // debounced auto-save would write the current form state into the
+        // preset that was just picked, destroying its contents.
         if self.selected_preset != self.mirrored_preset {
+            // Flush pending auto-save of the preset being switched away from,
+            // so edits made less than a debounce ago are not lost.
+            if self.config_dirty
+                && let Some(previous) = self.mirrored_preset.clone()
+                && let Err(e) = self.presets.save(&self.current_preset(previous.clone()))
+            {
+                self.set_preset_msg(true, format!("Не удалось автосохранить пресет: {e:#}"));
+            }
             self.mirrored_preset = self.selected_preset.clone();
             self.preset_name_edit = self.selected_preset.clone().unwrap_or_default();
             self.preset_delete_armed = false;
-            if self.settings.last_preset != self.selected_preset {
-                self.settings.last_preset = self.selected_preset.clone();
-                self.mark_dirty();
+            self.settings.last_preset = self.selected_preset.clone();
+            self.mark_dirty();
+            if let Some(name) = self.selected_preset.clone() {
+                match self.presets.load(&name) {
+                    Ok(preset) => {
+                        self.apply_preset(preset);
+                        self.set_preset_msg(false, format!("Пресет «{name}» применён"));
+                    }
+                    Err(e) => {
+                        self.selected_preset = None;
+                        self.mirrored_preset = None;
+                        self.preset_name_edit.clear();
+                        self.set_preset_msg(true, format!("Не удалось загрузить пресет: {e:#}"));
+                    }
+                }
             }
         }
         let selection = self.selected_preset.clone();
@@ -438,7 +460,7 @@ impl App {
                 });
             if ui
                 .add_enabled(has_selection, egui::Button::new("Загрузить"))
-                .on_hover_text("Применить пресет к текущей конфигурации")
+                .on_hover_text("Применить пресет заново (отменить правки, ещё не сохранённые в пресет)")
                 .clicked()
             {
                 self.preset_delete_armed = false;
@@ -1421,6 +1443,12 @@ impl eframe::App for App {
             self.server.stop();
         }
         if self.config_dirty {
+            // Flush pending auto-save into the selected preset too.
+            if let Some(name) = self.selected_preset.clone()
+                && let Err(e) = self.presets.save(&self.current_preset(name.clone()))
+            {
+                log::error!("Не удалось автосохранить пресет «{name}» при выходе: {e:#}");
+            }
             self.save_settings();
         }
     }
