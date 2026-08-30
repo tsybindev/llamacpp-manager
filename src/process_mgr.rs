@@ -391,14 +391,14 @@ fn monitor_loop(shared: Arc<Shared>, auto_restore: Arc<Mutex<crate::config::Auto
                 Ok(Some(status)) => Some(status),
                 Ok(None) => {
                     // Escalate to SIGKILL if SIGTERM was ignored for too long.
-                    if let Some(requested_at) = inner.stop_requested_at {
-                        if requested_at.elapsed() > GRACEFUL_SHUTDOWN_TIMEOUT {
-                            warn!("Процесс не отреагировал на SIGTERM, применяется SIGKILL");
-                            if let Some(child) = inner.child.as_mut() {
-                                let _ = child.kill();
-                            }
-                            inner.stop_requested_at = None;
+                    if let Some(requested_at) = inner.stop_requested_at
+                        && requested_at.elapsed() > GRACEFUL_SHUTDOWN_TIMEOUT
+                    {
+                        warn!("Процесс не отреагировал на SIGTERM, применяется SIGKILL");
+                        if let Some(child) = inner.child.as_mut() {
+                            let _ = child.kill();
                         }
+                        inner.stop_requested_at = None;
                     }
                     None
                 }
@@ -417,14 +417,14 @@ fn monitor_loop(shared: Arc<Shared>, auto_restore: Arc<Mutex<crate::config::Auto
                 && server_ready(&config.host, config.port)
             {
                 ready = true;
-                if let Ok(mut inner) = shared.inner.lock() {
-                    if inner.generation == generation {
-                        inner.state = ServerState::Ready;
-                        info!(
-                            "llama-server готов: http://{}:{}",
-                            config.host, config.port
-                        );
-                    }
+                if let Ok(mut inner) = shared.inner.lock()
+                    && inner.generation == generation
+                {
+                    inner.state = ServerState::Ready;
+                    info!(
+                        "llama-server готов: http://{}:{}",
+                        config.host, config.port
+                    );
                 }
             }
             continue;

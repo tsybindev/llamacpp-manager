@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod logger;
 mod params;
+mod presets;
 mod process_mgr;
 mod theme;
 

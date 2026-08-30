@@ -6,6 +6,7 @@ use egui::{Color32, RichText, ScrollArea};
 use crate::config::{self, Settings};
 use crate::logger::{self, LogHandle, LogEntry};
 use crate::params::{self, ParamDef, ParamKind, ParamsCatalog, ParamState};
+use crate::presets::{self, Preset};
 use crate::process_mgr::{ServerConfig, ServerState, ServerManager};
 use crate::theme::{self, ThemeMode};
 
@@ -59,6 +60,15 @@ pub struct App {
     server: ServerManager,
     server_form: ServerForm,
     params_catalog: ParamsCatalog,
+    presets: presets::PresetStore,
+    /// Preset picked in the combo box, if any.
+    selected_preset: Option<String>,
+    /// Name input used for save/rename/import operations.
+    preset_name_edit: String,
+    /// Second-click confirmation state for the delete button.
+    preset_delete_armed: bool,
+    /// Result of the last preset operation: (is_error, message).
+    preset_msg: Option<(bool, String)>,
     /// Fresh catalog fetched in the background, picked up on the next frame.
     catalog_refresh: std::sync::Arc<std::sync::Mutex<Option<ParamsCatalog>>>,
 }
@@ -111,10 +121,10 @@ impl App {
         if let Err(e) = settings.ensure_dirs() {
             eprintln!("не удалось создать каталоги данных: {e:#}");
         }
-        if !config::config_path().exists() {
-            if let Err(e) = config::save(&settings) {
-                eprintln!("не удалось сохранить настройки по умолчанию: {e:#}");
-            }
+        if !config::config_path().exists()
+            && let Err(e) = config::save(&settings)
+        {
+            eprintln!("не удалось сохранить настройки по умолчанию: {e:#}");
         }
         let (log_handle, logger_error) = logger::init(settings.debug_logging, &settings.logs_dir);
 
@@ -130,6 +140,13 @@ impl App {
         let params_catalog = params::bundled_catalog();
         let mut settings = settings;
         settings.params.merge_defaults(&params_catalog);
+
+        // Presets live next to the data directories (<data>/presets).
+        let presets_dir = settings
+            .logs_dir
+            .parent()
+            .map(|p| p.join("presets"))
+            .unwrap_or_else(|| settings.logs_dir.join("presets"));
 
         // Background catalog refresh: bundled catalog first, remote applied
         // when its version is newer.
@@ -165,6 +182,11 @@ impl App {
             server: ServerManager::new(settings.logs_dir.clone(), settings.auto_restore.clone()),
             server_form: ServerForm::default(),
             params_catalog,
+            presets: presets::PresetStore::new(presets_dir),
+            selected_preset: None,
+            preset_name_edit: String::new(),
+            preset_delete_armed: false,
+            preset_msg: None,
             catalog_refresh,
             settings,
             applied_theme: None,
@@ -277,11 +299,246 @@ impl App {
     fn server_page(&mut self, ui: &mut egui::Ui) {
         self.server_status_bar(ui);
         ui.add_space(8.0);
+        self.presets_section(ui);
+        ui.add_space(12.0);
         self.server_config_section(ui);
         ui.add_space(12.0);
         self.server_log_panel(ui);
         ui.add_space(12.0);
         self.app_log_panel(ui);
+    }
+
+    /// Preset management: load, save, rename, delete, import/export.
+    fn presets_section(&mut self, ui: &mut egui::Ui) {
+        ui.heading(RichText::new("Пресеты").size(16.0));
+        let names = self.presets.list();
+        // Forget a selection that no longer exists on disk.
+        if let Some(sel) = self.selected_preset.as_ref()
+            && !names.contains(sel)
+        {
+            self.selected_preset = None;
+            self.preset_delete_armed = false;
+        }
+        let selection = self.selected_preset.clone();
+        let has_selection = selection.is_some();
+
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let label = selection.clone().unwrap_or_else(|| "— выберите пресет —".into());
+            egui::ComboBox::from_id_salt("preset-select")
+                .selected_text(label)
+                .width(240.0)
+                .show_ui(ui, |ui| {
+                    for name in &names {
+                        ui.selectable_value(&mut self.selected_preset, Some(name.clone()), name.clone());
+                    }
+                });
+            if ui
+                .add_enabled(has_selection, egui::Button::new("Загрузить"))
+                .on_hover_text("Применить пресет к текущей конфигурации")
+                .clicked()
+            {
+                self.preset_delete_armed = false;
+                self.load_selected_preset();
+            }
+            let delete_label = if self.preset_delete_armed { "Точно удалить?" } else { "Удалить" };
+            if ui
+                .add_enabled(has_selection, egui::Button::new(delete_label))
+                .on_hover_text("Второй щелчок подтверждает удаление")
+                .clicked()
+            {
+                if self.preset_delete_armed {
+                    self.delete_selected_preset();
+                    self.preset_delete_armed = false;
+                } else {
+                    self.preset_delete_armed = true;
+                }
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.add_sized([LABEL_WIDTH, 18.0], egui::Label::new("Имя пресета"));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.preset_name_edit)
+                    .desired_width(240.0)
+                    .hint_text("например: gemma-mtp-локально"),
+            );
+            if ui
+                .add_enabled(!self.preset_name_edit.trim().is_empty(), egui::Button::new("Сохранить"))
+                .on_hover_text("Сохранить текущую конфигурацию и параметры под введённым именем")
+                .clicked()
+            {
+                self.save_current_as_preset();
+            }
+            if ui
+                .add_enabled(has_selection && !self.preset_name_edit.trim().is_empty(), egui::Button::new("Переименовать"))
+                .on_hover_text("Переименовать выбранный пресет в имя из поля")
+                .clicked()
+            {
+                self.preset_delete_armed = false;
+                self.rename_selected_preset();
+            }
+            if ui.button("Экспорт в файл…").clicked() {
+                self.export_selected_preset();
+            }
+            if ui.button("Импорт из файла…").clicked() {
+                self.import_preset_file();
+            }
+        });
+
+        if let Some((is_error, message)) = &self.preset_msg {
+            let color = if *is_error { theme::ERR_RED } else { theme::OK_GREEN };
+            ui.label(RichText::new(message).color(color).small());
+        }
+    }
+
+    fn set_preset_msg(&mut self, is_error: bool, message: String) {
+        if is_error {
+            log::error!("Пресеты: {message}");
+        } else {
+            log::info!("Пресеты: {message}");
+        }
+        self.preset_msg = Some((is_error, message));
+    }
+
+    /// Snapshot of the current form + parameters as a preset.
+    fn current_preset(&self, name: String) -> Preset {
+        Preset {
+            name,
+            binary: self.server_form.binary.clone(),
+            model: self.server_form.model.clone(),
+            host: self.server_form.host.clone(),
+            port: self.server_form.port,
+            extra_args: self.server_form.extra_args.clone(),
+            params: self.settings.params.clone(),
+        }
+    }
+
+    fn apply_preset(&mut self, mut preset: Preset) {
+        self.server_form.binary = preset.binary.clone();
+        self.server_form.model = preset.model.clone();
+        self.server_form.host = preset.host.clone();
+        self.server_form.port = preset.port;
+        self.server_form.extra_args = preset.extra_args.clone();
+        self.server_form.last_error = None;
+        preset.params.merge_defaults(&self.params_catalog);
+        self.settings.params = preset.params;
+        self.mark_dirty();
+    }
+
+    fn load_selected_preset(&mut self) {
+        let Some(name) = self.selected_preset.clone() else {
+            return;
+        };
+        match self.presets.load(&name) {
+            Ok(preset) => {
+                self.apply_preset(preset);
+                self.set_preset_msg(false, format!("Пресет «{name}» загружен"));
+            }
+            Err(e) => self.set_preset_msg(true, format!("Не удалось загрузить пресет: {e:#}")),
+        }
+    }
+
+    fn save_current_as_preset(&mut self) {
+        let name = self.preset_name_edit.trim().to_string();
+        let preset = self.current_preset(name.clone());
+        match self.presets.save(&preset) {
+            Ok(()) => {
+                self.selected_preset = Some(name.clone());
+                self.preset_delete_armed = false;
+                self.set_preset_msg(false, format!("Пресет «{name}» сохранён"));
+            }
+            Err(e) => self.set_preset_msg(true, format!("Не удалось сохранить пресет: {e:#}")),
+        }
+    }
+
+    fn rename_selected_preset(&mut self) {
+        let new_name = self.preset_name_edit.trim().to_string();
+        let Some(old_name) = self.selected_preset.clone() else {
+            return;
+        };
+        if new_name == old_name {
+            self.set_preset_msg(true, "Новое имя совпадает с текущим".into());
+            return;
+        }
+        match self.presets.load(&old_name).map(|mut p| {
+            p.name = new_name.clone();
+            p
+        }) {
+            Ok(renamed) => match self.presets.save(&renamed).and_then(|()| self.presets.delete(&old_name)) {
+                Ok(()) => {
+                    self.selected_preset = Some(new_name.clone());
+                    self.set_preset_msg(false, format!("«{old_name}» переименован в «{new_name}»"));
+                }
+                Err(e) => self.set_preset_msg(true, format!("Не удалось переименовать пресет: {e:#}")),
+            },
+            Err(e) => self.set_preset_msg(true, format!("Не удалось переименовать пресет: {e:#}")),
+        }
+    }
+
+    fn delete_selected_preset(&mut self) {
+        let Some(name) = self.selected_preset.clone() else {
+            return;
+        };
+        match self.presets.delete(&name) {
+            Ok(()) => {
+                self.selected_preset = None;
+                self.set_preset_msg(false, format!("Пресет «{name}» удалён"));
+            }
+            Err(e) => self.set_preset_msg(true, format!("Не удалось удалить пресет: {e:#}")),
+        }
+    }
+
+    fn export_selected_preset(&mut self) {
+        let Some(name) = self.selected_preset.clone() else {
+            self.set_preset_msg(true, "Сначала выберите пресет для экспорта".into());
+            return;
+        };
+        match self.presets.load(&name) {
+            Ok(preset) => {
+                let default_file = format!("{}.json", presets::sanitize_name(&name));
+                let dialog = rfd::FileDialog::new()
+                    .set_title("Куда сохранить пресет")
+                    .set_file_name(&default_file)
+                    .add_filter("JSON-пресет", &["json"]);
+                if let Some(path) = dialog.save_file() {
+                    match presets::export_to(&preset, &path) {
+                        Ok(()) => self.set_preset_msg(false, format!("Пресет экспортирован: {}", path.display())),
+                        Err(e) => self.set_preset_msg(true, format!("Не удалось экспортировать пресет: {e:#}")),
+                    }
+                }
+            }
+            Err(e) => self.set_preset_msg(true, format!("Не удалось прочитать пресет: {e:#}")),
+        }
+    }
+
+    fn import_preset_file(&mut self) {
+        // The dialog must be created and awaited only on click —
+        // pick_file is a blocking call.
+        let dialog = rfd::FileDialog::new()
+            .set_title("Выберите файл пресета")
+            .add_filter("JSON-пресет", &["json"]);
+        if let Some(path) = dialog.pick_file() {
+            match presets::import_from(&path) {
+                Ok(mut preset) => {
+                    // A typed name wins over the name inside the file / file stem.
+                    let typed = self.preset_name_edit.trim().to_string();
+                    if !typed.is_empty() {
+                        preset.name = typed;
+                    }
+                    let name = preset.name.clone();
+                    match self.presets.save(&preset) {
+                        Ok(()) => {
+                            self.selected_preset = Some(name.clone());
+                            self.preset_delete_armed = false;
+                            self.set_preset_msg(false, format!("Пресет «{name}» импортирован"));
+                        }
+                        Err(e) => self.set_preset_msg(true, format!("Не удалось импортировать пресет: {e:#}")),
+                    }
+                }
+                Err(e) => self.set_preset_msg(true, format!("Не удалось импортировать пресет: {e:#}")),
+            }
+        }
     }
 
     /// Pre-start checks shown to the user before spawning the process.
@@ -880,13 +1137,12 @@ fn param_row(ui: &mut egui::Ui, def: &ParamDef, state: &mut ParamState) {
                             {
                                 return Some(serde_json::json!(text.trim()));
                             }
-                            if ui.small_button("Обзор…").clicked() {
-                                if let Some(file) = rfd::FileDialog::new()
+                            if ui.small_button("Обзор…").clicked()
+                                && let Some(file) = rfd::FileDialog::new()
                                     .set_title(format!("Выберите: {}", def.name))
                                     .pick_file()
-                                {
-                                    return Some(serde_json::json!(file.display().to_string()));
-                                }
+                            {
+                                return Some(serde_json::json!(file.display().to_string()));
                             }
                         }
                         ParamKind::Bool => unreachable!(),
