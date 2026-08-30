@@ -7,7 +7,7 @@ pub const WARN_YELLOW: Color32 = Color32::from_rgb(0xD9, 0x94, 0x06);
 pub const ERR_RED: Color32 = Color32::from_rgb(0xDC, 0x2C, 0x36);
 
 /// User-selectable UI theme.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum ThemeMode {
     Dark,
     Light,
