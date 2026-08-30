@@ -3,10 +3,16 @@
 ## [/] In Progress
 - [ ] Этап 6: сборки llama.cpp (GitHub Releases)
   - [x] Шаг A: модуль `github.rs` — клиент GitHub Releases
-  - [ ] Шаг B: модуль `builds.rs` — кэш версий, скачивание с прогрессом
+  - [x] Шаг B: модуль `builds.rs` — кэш версий, скачивание с прогрессом
   - [ ] Шаг C: UI страницы «Сборки», выбор активной версии
 
 ## [x] Completed
+- 2026-08-30 18:10 — Этап 6, шаг B: модуль builds.rs (зависимость zip 8.6, только deflate):
+  - BuildsStore: installed() — сканирование каталога сборок (разбор имён llama-<tag>-<backend>), dir_for, install() — скачивание + распаковка + атомарная замена (staging → rename), повторная установка заменяет версию.
+  - download_file: ureq без timeout_global (иначе накрыл бы чтение тела), connect-таймаут 30 с, чанки 64 КБ, прогресс не чаще раза в МБ (канал UI не перегружается).
+  - install_zip: zip-slip защита через enclosed_name, проверка наличия llama-server в архиве, staging-каталог удаляется при ошибке. Распаковка и замена протестированы на сгенерированном zip.
+  - Кэш списка релизов: releases-cache.json на сутки (fetch_releases_cached), при недоступности сети отдаётся устаревший кэш.
+  - cargo test 25 passed, clippy чисто, smoke-запуск свежей сборки ок.
 - 2026-08-30 17:40 — Этап 6, шаг A: модуль github.rs:
   - Типы Release/Asset (serde, rename tag_name), разбор ответа /releases — parse_releases тестируется без сети.
   - Классификация ассетов: classify_asset по имени файла (win/linux, cpu/vulkan/cuda; отсекает cudart/src/tar.gz), buildable_assets → BuildAsset с dir_name для локального каталога.

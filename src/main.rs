@@ -1,4 +1,5 @@
 mod app;
+mod builds;
 mod config;
 mod github;
 mod logger;

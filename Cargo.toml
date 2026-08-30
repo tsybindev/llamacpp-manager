@@ -15,6 +15,7 @@ serde = "1.0.229"
 serde_json = "1.0.151"
 shlex = "2.0.1"
 ureq = "3.4.0"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [target."cfg(unix)".dependencies]
 libc = "0.2.189"
