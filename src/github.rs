@@ -2,8 +2,6 @@
 //!
 //! Чистая работа с API: типы, разбор JSON и фильтрация ассетов.
 //! Локальный кэш и скачивание — в `builds.rs` и слоях выше.
-// Разрешение снимется, когда модуль начнёт использоваться слоями выше.
-#![allow(dead_code)]
 
 use std::time::Duration;
 
@@ -50,13 +48,6 @@ impl TargetOs {
             Some(Self::Linux)
         } else {
             None
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Windows => "Windows",
-            Self::Linux => "Linux",
         }
     }
 }

@@ -1,9 +1,12 @@
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use egui::{Color32, RichText, ScrollArea};
 
+use crate::builds;
 use crate::config::{self, Settings};
+use crate::github;
 use crate::logger::{self, LogHandle, LogEntry};
 use crate::params::{self, ParamDef, ParamKind, ParamsCatalog, ParamState};
 use crate::presets::{self, Preset};
@@ -72,8 +75,36 @@ pub struct App {
     preset_delete_armed: bool,
     /// Result of the last preset operation: (is_error, message).
     preset_msg: Option<(bool, String)>,
+    // --- Состояние страницы «Сборки» ---
+    /// Список релизов llama.cpp (из кэша или сети).
+    build_releases: Option<Vec<github::Release>>,
+    /// Канал фонового обновления списка релизов.
+    build_releases_rx: Option<mpsc::Receiver<Result<Vec<github::Release>, String>>>,
+    build_releases_loading: bool,
+    build_releases_error: Option<String>,
+    /// Текущее скачивание/установка сборки, если идёт.
+    build_download: Option<BuildDownload>,
     /// Fresh catalog fetched in the background, picked up on the next frame.
     catalog_refresh: std::sync::Arc<std::sync::Mutex<Option<ParamsCatalog>>>,
+}
+
+/// Message from the background build download thread.
+enum BuildDownloadMsg {
+    Progress(builds::Progress),
+    Done(Result<builds::InstalledBuild, String>),
+}
+
+/// Состояние скачивания и установки одной сборки llama.cpp.
+struct BuildDownload {
+    asset: github::BuildAsset,
+    downloaded: u64,
+    total: u64,
+    extracting: bool,
+    rx: mpsc::Receiver<BuildDownloadMsg>,
+    /// Установленная сборка (после успешного завершения).
+    installed: Option<builds::InstalledBuild>,
+    /// Результат: (успех, сообщение для UI).
+    result: Option<(bool, String)>,
 }
 
 /// Editable server launch parameters (will become presets in a later stage).
@@ -191,6 +222,11 @@ impl App {
             preset_name_edit: String::new(),
             preset_delete_armed: false,
             preset_msg: None,
+            build_releases: None,
+            build_releases_rx: None,
+            build_releases_loading: false,
+            build_releases_error: None,
+            build_download: None,
             catalog_refresh,
             settings,
             applied_theme: None,
@@ -1009,7 +1045,322 @@ impl App {
     }
 
     fn builds_page(&mut self, ui: &mut egui::Ui) {
-        ui.label("Экран сборок будет здесь: релизы llama.cpp и выбор бэкенда.");
+        self.poll_builds_refresh();
+        self.poll_build_download();
+        // Список релизов лениво подгружается при первом открытии страницы.
+        if self.build_releases.is_none()
+            && self.build_releases_rx.is_none()
+            && !self.build_releases_loading
+            && self.build_releases_error.is_none()
+        {
+            self.start_builds_refresh(false);
+        }
+
+        ui.heading(RichText::new("Установленные сборки").size(16.0));
+        let store = builds::BuildsStore::new(self.settings.builds_dir.clone());
+        let installed = store.installed();
+        if installed.is_empty() {
+            ui.label(
+                RichText::new("Сборок пока нет. Скачайте релиз ниже — бинарник llama-server попадёт в библиотеку сборок.").weak(),
+            );
+        }
+        for build in &installed {
+            ui.horizontal(|ui| {
+                let binary = build.server_binary();
+                let is_active = binary.as_ref() == Some(&self.server_form.binary);
+                let mut label = RichText::new(build.label());
+                if is_active {
+                    label = label.color(theme::OK_GREEN).strong();
+                }
+                ui.label(label);
+                if let Some(bin) = &binary {
+                    ui.label(RichText::new(bin.display().to_string()).small().weak());
+                } else {
+                    ui.label(RichText::new("llama-server не найден").small().color(theme::WARN_YELLOW));
+                }
+                if ui
+                    .add_enabled(
+                        binary.is_some() && !is_active,
+                        egui::Button::new("Сделать активной"),
+                    )
+                    .on_hover_text("Использовать llama-server из этой сборки при запуске")
+                    .clicked()
+                    && let Some(bin) = binary
+                {
+                    self.activate_build_binary(build.tag.clone(), bin);
+                }
+            });
+        }
+        ui.add_space(12.0);
+
+        ui.heading(RichText::new("Релизы llama.cpp").size(16.0));
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !self.build_releases_loading,
+                    egui::Button::new("Обновить список"),
+                )
+                .clicked()
+            {
+                self.start_builds_refresh(true);
+            }
+            if self.build_releases_loading {
+                ui.add(egui::Spinner::new().size(16.0));
+                ui.label("Загрузка списка релизов…");
+            }
+            if let Some(error) = &self.build_releases_error {
+                ui.label(RichText::new(error).small().color(theme::ERR_RED));
+            }
+        });
+        ui.add_space(4.0);
+        self.build_download_panel(ui);
+
+        let assets = self.current_os_assets();
+        if assets.is_empty() && !self.build_releases_loading && self.build_releases_error.is_none()
+        {
+            ui.label("Нет доступных релизов для вашей платформы.");
+        }
+        ScrollArea::vertical().show(ui, |ui| {
+            let mut last_tag = String::new();
+            for asset in &assets {
+                if asset.tag != last_tag {
+                    last_tag = asset.tag.clone();
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(&asset.tag).strong());
+                }
+                ui.horizontal(|ui| {
+                    let already_installed = store.dir_for(asset).is_dir();
+                    let size = format_size(asset.asset.size);
+                    let mut text = format!("{} · {}", asset.backend.label(), size);
+                    if already_installed {
+                        text.push_str("  ✓");
+                    }
+                    let tooltip = format!(
+                        "{}{}\nСкачать и установить в библиотеку сборок",
+                        asset.asset.name,
+                        if already_installed {
+                            " (уже установлена — будет заменена)"
+                        } else {
+                            ""
+                        }
+                    );
+                    if ui
+                        .add_enabled(
+                            self.build_download.is_none(),
+                            egui::Button::new(text),
+                        )
+                        .on_hover_text(tooltip)
+                        .clicked()
+                    {
+                        self.start_build_download(asset.clone());
+                    }
+                });
+            }
+        });
+    }
+
+    /// Ассеты релизов для текущей ОС (плоский список в порядке релизов).
+    fn current_os_assets(&self) -> Vec<github::BuildAsset> {
+        let current_os = github::TargetOs::current();
+        self.build_releases
+            .as_deref()
+            .map(github::buildable_assets)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|asset| Some(asset.os) == current_os)
+            .collect()
+    }
+
+    /// Панель прогресса и результата текущего скачивания сборки.
+    fn build_download_panel(&mut self, ui: &mut egui::Ui) {
+        let mut clear_download = false;
+        let mut activate: Option<(String, PathBuf)> = None;
+        if let Some(download) = self.build_download.as_mut() {
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&download.asset.asset.name).strong());
+                    if let Some((is_error, message)) = &download.result {
+                        let color = if *is_error {
+                            theme::ERR_RED
+                        } else {
+                            theme::OK_GREEN
+                        };
+                        ui.label(RichText::new(message).color(color));
+                        if ui.small_button("Скрыть").clicked() {
+                            clear_download = true;
+                        }
+                    }
+                });
+                if download.result.is_none() {
+                    if download.extracting {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Spinner::new().size(14.0));
+                            ui.label("Распаковка архива…");
+                        });
+                    } else {
+                        let fraction = if download.total > 0 {
+                            download.downloaded as f32 / download.total as f32
+                        } else {
+                            0.0
+                        };
+                        ui.add(
+                            egui::ProgressBar::new(fraction)
+                                .show_percentage()
+                                .desired_width(ui.available_width()),
+                        );
+                        let total = if download.total > 0 {
+                            format_size(download.total)
+                        } else {
+                            "?".to_string()
+                        };
+                        ui.label(format!(
+                            "{} из {}",
+                            format_size(download.downloaded),
+                            total
+                        ));
+                    }
+                } else if let Some(build) = &download.installed
+                    && let Some(bin) = build.server_binary()
+                    && ui.small_button("Сделать бинарником сервера").clicked()
+                {
+                    activate = Some((build.tag.clone(), bin));
+                }
+            });
+        }
+        if clear_download {
+            self.build_download = None;
+        }
+        if let Some((tag, bin)) = activate {
+            self.activate_build_binary(tag, bin);
+        }
+    }
+
+    /// Запустить фоновую загрузку списка релизов (с кэшем на сутки).
+    fn start_builds_refresh(&mut self, force: bool) {
+        if self.build_releases_loading {
+            return;
+        }
+        self.build_releases_loading = true;
+        self.build_releases_error = None;
+        let (tx, rx) = mpsc::channel();
+        let cache_dir = self.settings.builds_dir.clone();
+        let _ = std::thread::Builder::new()
+            .name("builds-refresh".into())
+            .spawn(move || {
+                let result = builds::fetch_releases_cached(&cache_dir, force)
+                    .map_err(|e| format!("{e:#}"));
+                let _ = tx.send(result);
+            });
+        self.build_releases_rx = Some(rx);
+    }
+
+    /// Подобрать результат фоновой загрузки списка релизов.
+    fn poll_builds_refresh(&mut self) {
+        let received = self.build_releases_rx.as_ref().map(|rx| rx.try_recv());
+        match received {
+            Some(Ok(Ok(releases))) => {
+                self.build_releases = Some(releases);
+                self.build_releases_rx = None;
+                self.build_releases_loading = false;
+                log::info!("Список релизов llama.cpp получен");
+            }
+            Some(Ok(Err(message))) => {
+                self.build_releases_error = Some(message.clone());
+                self.build_releases_rx = None;
+                self.build_releases_loading = false;
+                log::warn!("Не удалось получить список релизов: {message}");
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) => {}
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.build_releases_rx = None;
+                self.build_releases_loading = false;
+            }
+            None => {}
+        }
+    }
+
+    /// Запустить скачивание и установку сборки в фоновом потоке.
+    fn start_build_download(&mut self, asset: github::BuildAsset) {
+        if self.build_download.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let store = builds::BuildsStore::new(self.settings.builds_dir.clone());
+        let size = asset.asset.size;
+        let name = asset.asset.name.clone();
+        let tag = asset.tag.clone();
+        let thread_asset = asset.clone();
+        let _ = std::thread::Builder::new()
+            .name("build-download".into())
+            .spawn(move || {
+                let outcome = store.install(&thread_asset, |progress| {
+                    let _ = tx.send(BuildDownloadMsg::Progress(progress));
+                });
+                let _ = tx.send(BuildDownloadMsg::Done(
+                    outcome.map_err(|e| format!("{e:#}")),
+                ));
+            });
+        log::info!("Начато скачивание сборки {tag}: {name}");
+        self.build_download = Some(BuildDownload {
+            asset,
+            downloaded: 0,
+            total: size,
+            extracting: false,
+            rx,
+            installed: None,
+            result: None,
+        });
+    }
+
+    /// Подобрать сообщения из фонового потока скачивания сборки.
+    fn poll_build_download(&mut self) {
+        let Some(download) = self.build_download.as_mut() else {
+            return;
+        };
+        loop {
+            match download.rx.try_recv() {
+                Ok(BuildDownloadMsg::Progress(builds::Progress::Downloading {
+                    downloaded,
+                    total,
+                })) => {
+                    download.downloaded = downloaded;
+                    if total > 0 {
+                        download.total = total;
+                    }
+                }
+                Ok(BuildDownloadMsg::Progress(builds::Progress::Extracting)) => {
+                    download.extracting = true;
+                }
+                Ok(BuildDownloadMsg::Done(Ok(build))) => {
+                    log::info!("Сборка {} установлена", build.label());
+                    download.installed = Some(build);
+                    download.result = Some((false, "Установлена".to_string()));
+                    break;
+                }
+                Ok(BuildDownloadMsg::Done(Err(message))) => {
+                    download.result = Some((true, message.clone()));
+                    log::error!("Не удалось установить сборку: {message}");
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if download.result.is_none() {
+                        download.result =
+                            Some((true, "поток скачивания завершился без результата".into()));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Сделать llama-server из установленной сборки активным бинарником.
+    fn activate_build_binary(&mut self, tag: String, binary: PathBuf) {
+        if self.server_form.binary != binary {
+            self.server_form.binary = binary.clone();
+            self.mark_dirty();
+        }
+        log::info!("Активная сборка: {tag} ({})", binary.display());
     }
 
     fn settings_page(&mut self, ui: &mut egui::Ui) {
@@ -1336,6 +1687,23 @@ fn path_row(ui: &mut egui::Ui, label: &str, path: &mut PathBuf, hint: &str, pick
         }
     });
     changed
+}
+
+/// Human-readable file size: «245 МБ», «1.4 ГБ».
+fn format_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * KB;
+    const GB: f64 = MB * KB;
+    let bytes = bytes as f64;
+    if bytes >= GB {
+        format!("{:.1} ГБ", bytes / GB)
+    } else if bytes >= MB {
+        format!("{:.0} МБ", bytes / MB)
+    } else if bytes >= KB {
+        format!("{:.0} КБ", bytes / KB)
+    } else {
+        format!("{bytes} Б")
+    }
 }
 
 /// Color and human hint for a server state, shared by the sidebar and the

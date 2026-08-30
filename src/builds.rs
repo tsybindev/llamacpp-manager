@@ -1,7 +1,5 @@
 //! Локальная библиотека сборок llama.cpp: скачивание релизов с GitHub,
 //! распаковка zip и кэш списка версий.
-// Разрешение снимется, когда модуль начнёт использоваться UI.
-#![allow(dead_code)]
 
 use std::fs::{self, File};
 use std::io::{Read as _, Write as _};
@@ -281,6 +279,15 @@ fn now_unix() -> u64 {
 /// Список релизов с GitHub с локальным кэшем на сутки.
 /// При недоступности сети возвращает устаревший кэш, если он есть.
 pub fn fetch_releases_cached(cache_dir: &Path, force_refresh: bool) -> Result<Vec<Release>> {
+    fetch_releases_cached_with(cache_dir, force_refresh, github::fetch_releases)
+}
+
+/// То же с подменяемой сетевой функцией — для детерминированных тестов.
+fn fetch_releases_cached_with(
+    cache_dir: &Path,
+    force_refresh: bool,
+    fetch: impl Fn() -> Result<Vec<Release>>,
+) -> Result<Vec<Release>> {
     fs::create_dir_all(cache_dir).with_context(|| {
         format!("не удалось создать каталог {}", cache_dir.display())
     })?;
@@ -293,7 +300,7 @@ pub fn fetch_releases_cached(cache_dir: &Path, force_refresh: bool) -> Result<Ve
         return Ok(cached.releases);
     }
 
-    match github::fetch_releases() {
+    match fetch() {
         Ok(releases) => {
             let cache = ReleasesCache {
                 fetched_at: now_unix(),
@@ -433,6 +440,28 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// Сетевой тест: потоковое скачивание маленького файла по HTTP.
+    #[test]
+    #[ignore = "требует доступ к сети"]
+    fn download_file_live() {
+        let root = temp_root("download-live");
+        let dest = root.join("params_catalog.json");
+        let mut total_seen = 0u64;
+        download_file(
+            "https://raw.githubusercontent.com/tsybindev/llamacpp-manager/main/assets/params_catalog.json",
+            &dest,
+            |downloaded, total| {
+                total_seen = total;
+                assert!(downloaded <= total.max(1));
+            },
+        )
+        .expect("скачивание");
+        let text = fs::read_to_string(&dest).expect("файл");
+        assert!(text.contains("\"version\""));
+        let _ = total_seen;
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn releases_cache_roundtrip_and_stale_fallback() {
         let root = temp_root("cache");
@@ -456,8 +485,7 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].tag, "b10635");
 
-        // Устаревший кэш + недоступная сеть (заведомо битый URL в github::fetch_releases
-        // не подменить, поэтому проверяем только чтение устаревшего кэша вручную).
+        // Устаревший кэш + отказ сети → отдаётся устаревший кэш.
         let cache = ReleasesCache {
             fetched_at: now_unix() - RELEASES_CACHE_AGE_SECS - 10,
             releases: releases.clone(),
@@ -467,11 +495,29 @@ mod tests {
             serde_json::to_string(&cache).unwrap(),
         )
         .unwrap();
-        // force_refresh=true потребует сеть; у нас есть сеть в CI-машине,
-        // поэтому проверяем лишь, что функция не падает и возвращает список.
-        let got = fetch_releases_cached(&root, true);
-        assert!(got.is_ok());
+        let got = fetch_releases_cached_with(&root, true, || {
+            Err(anyhow::anyhow!("сеть недоступна"))
+        })
+        .expect("устаревший кэш при отказе сети");
+        assert_eq!(got[0].tag, "b10635");
+
+        // Нет кэша + отказ сети → ошибка.
+        let empty = temp_root("cache-empty");
+        let err = fetch_releases_cached_with(&empty, true, || {
+            Err(anyhow::anyhow!("сеть недоступна"))
+        });
+        assert!(err.is_err());
+
+        // Обновление сети перезаписывает кэш.
+        let fresh = vec![github::Release {
+            tag: "b20000".into(),
+            published_at: String::new(),
+            assets: vec![],
+        }];
+        let got = fetch_releases_cached_with(&root, true, || Ok(fresh.clone())).expect("сеть ок");
+        assert_eq!(got[0].tag, "b20000");
 
         std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&empty).ok();
     }
 }
