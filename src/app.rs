@@ -7,6 +7,7 @@ use egui::{Color32, RichText, ScrollArea};
 use crate::builds;
 use crate::config::{self, Settings};
 use crate::github;
+use crate::huggingface;
 use crate::logger::{self, LogHandle, LogEntry};
 use crate::params::{self, ParamDef, ParamKind, ParamsCatalog, ParamState};
 use crate::presets::{self, Preset};
@@ -90,8 +91,36 @@ pub struct App {
     build_download: Option<BuildDownload>,
     /// Сборка, ожидающая подтверждения удаления (второй щелчок).
     build_delete_armed: Option<PathBuf>,
+    // --- Состояние страницы «Модели» ---
+    hf_query: String,
+    hf_results: Option<Vec<huggingface::HfModel>>,
+    hf_search_rx: Option<mpsc::Receiver<Result<Vec<huggingface::HfModel>, String>>>,
+    hf_searching: bool,
+    /// Репозиторий, выбранный из результатов поиска.
+    hf_selected_repo: Option<String>,
+    hf_files: Vec<huggingface::HfFile>,
+    hf_files_rx: Option<mpsc::Receiver<Result<Vec<huggingface::HfFile>, String>>>,
+    hf_error: Option<String>,
+    /// Текущее скачивание файла модели, если идёт.
+    model_download: Option<ModelDownload>,
     /// Fresh catalog fetched in the background, picked up on the next frame.
     catalog_refresh: std::sync::Arc<std::sync::Mutex<Option<ParamsCatalog>>>,
+}
+
+/// Message from the background model file download thread.
+enum ModelDownloadMsg {
+    Progress(u64, u64),
+    Done(Result<(), String>),
+}
+
+/// Состояние скачивания одного файла GGUF-модели.
+struct ModelDownload {
+    repo: String,
+    path: String,
+    downloaded: u64,
+    total: u64,
+    rx: mpsc::Receiver<ModelDownloadMsg>,
+    error: Option<String>,
 }
 
 /// Message from the background build download thread.
@@ -235,6 +264,15 @@ impl App {
             build_show_all: false,
             build_download: None,
             build_delete_armed: None,
+            hf_query: String::new(),
+            hf_results: None,
+            hf_search_rx: None,
+            hf_searching: false,
+            hf_selected_repo: None,
+            hf_files: Vec::new(),
+            hf_files_rx: None,
+            hf_error: None,
+            model_download: None,
             catalog_refresh,
             settings,
             applied_theme: None,
@@ -1049,7 +1087,359 @@ impl App {
     }
 
     fn models_page(&mut self, ui: &mut egui::Ui) {
-        ui.label("Экран моделей будет здесь: поиск и скачивание GGUF с HuggingFace.");
+        self.poll_hf_search();
+        self.poll_hf_files();
+        self.poll_model_download();
+
+        ui.heading(RichText::new("Поиск GGUF-моделей на HuggingFace").size(16.0));
+        ui.horizontal(|ui| {
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.hf_query)
+                    .desired_width(340.0)
+                    .hint_text("например: gemma 3n gguf"),
+            );
+            let enter_pressed =
+                response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if ui
+                .add_enabled(!self.hf_searching, egui::Button::new("Найти"))
+                .clicked()
+                || enter_pressed
+            {
+                self.start_hf_search();
+            }
+            if self.hf_searching {
+                ui.add(egui::Spinner::new().size(16.0));
+            }
+            if let Some(error) = &self.hf_error {
+                ui.label(RichText::new(error).small().color(theme::ERR_RED));
+            }
+        });
+        ui.add_space(8.0);
+
+        if let Some(results) = self.hf_results.clone() {
+            ui.label(RichText::new(format!("Найдено: {}", results.len())).weak());
+            ScrollArea::vertical()
+                .max_height(150.0)
+                .id_salt("hf-results")
+                .show(ui, |ui| {
+                    for model in &results {
+                        ui.horizontal(|ui| {
+                            let selected =
+                                self.hf_selected_repo.as_deref() == Some(model.id.as_str());
+                            let text = format!(
+                                "{}  —  загрузок: {}, звёзд: {}",
+                                model.id, model.downloads, model.likes
+                            );
+                            if ui
+                                .selectable_label(selected, text)
+                                .on_hover_text("Показать файлы модели")
+                                .clicked()
+                            {
+                                self.select_hf_repo(model.id.clone());
+                            }
+                        });
+                    }
+                });
+        }
+
+        if let Some(repo) = self.hf_selected_repo.clone() {
+            ui.add_space(12.0);
+            ui.heading(RichText::new(format!("Файлы {repo}")).size(16.0));
+            if self.hf_files_rx.is_some() {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(14.0));
+                    ui.label("Получение списка файлов…");
+                });
+            }
+            let files = self.hf_files.clone();
+            for file in &files {
+                ui.horizontal(|ui| {
+                    ui.label(&file.path);
+                    if let Some(quant) = huggingface::quant_from_filename(&file.path) {
+                        ui.label(RichText::new(quant).small().color(theme::ACCENT));
+                    }
+                    ui.label(RichText::new(format_size(file.size)).small().weak());
+                    if ui
+                        .add_enabled(
+                            !self.is_downloading_model(&file.path),
+                            egui::Button::new("Скачать"),
+                        )
+                        .on_hover_text(format!(
+                            "Скачать в {}\n{}",
+                            self.settings.models_dir.display(),
+                            file.path
+                        ))
+                        .clicked()
+                    {
+                        self.start_model_download(repo.clone(), file.clone());
+                    }
+                });
+            }
+            self.model_download_panel(ui);
+        }
+
+        ui.add_space(12.0);
+        self.model_library_section(ui);
+    }
+
+    /// Локальная библиотека моделей: gguf-файлы в models_dir (глубина 2).
+    fn model_library_section(&mut self, ui: &mut egui::Ui) {
+        ui.heading(RichText::new("Локальная библиотека моделей").size(16.0));
+        ui.label(
+            RichText::new(format!("Каталог: {}", self.settings.models_dir.display())).weak(),
+        );
+        let models = library_models(&self.settings.models_dir);
+        if models.is_empty() {
+            ui.label(
+                RichText::new("Пока нет скачанных моделей — найдите и скачайте выше, или укажите путь к .gguf вручную на странице «Сервер».").weak(),
+            );
+        }
+        for path in models {
+            ui.horizontal(|ui| {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let is_active = self.server_form.model == path;
+                let mut label = RichText::new(format!("{name} · {}", format_size(size)));
+                if is_active {
+                    label = label.color(theme::OK_GREEN).strong();
+                }
+                ui.label(label);
+                if ui
+                    .add_enabled(!is_active, egui::Button::new("Сделать моделью сервера"))
+                    .on_hover_text(path.display().to_string())
+                    .clicked()
+                {
+                    self.server_form.model = path.clone();
+                    self.mark_dirty();
+                    log::info!("Активная модель: {}", path.display());
+                }
+            });
+        }
+    }
+
+    /// Панель прогресса/ошибки скачивания файла модели.
+    fn model_download_panel(&mut self, ui: &mut egui::Ui) {
+        let mut clear_download = false;
+        if let Some(download) = self.model_download.as_mut() {
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("{}/{}", download.repo, download.path)).strong(),
+                    );
+                    if let Some(error) = &download.error {
+                        ui.label(RichText::new(error).color(theme::ERR_RED));
+                        if ui.small_button("Скрыть").clicked() {
+                            clear_download = true;
+                        }
+                    }
+                });
+                if download.error.is_none() {
+                    let fraction = if download.total > 0 {
+                        download.downloaded as f32 / download.total as f32
+                    } else {
+                        0.0
+                    };
+                    ui.add(
+                        egui::ProgressBar::new(fraction)
+                            .show_percentage()
+                            .desired_width(ui.available_width()),
+                    );
+                    ui.label(format!(
+                        "{} из {}",
+                        format_size(download.downloaded),
+                        if download.total > 0 {
+                            format_size(download.total)
+                        } else {
+                            "?".to_string()
+                        }
+                    ));
+                }
+            });
+        }
+        if clear_download {
+            self.model_download = None;
+        }
+    }
+
+    fn is_downloading_model(&self, path: &str) -> bool {
+        self.model_download
+            .as_ref()
+            .is_some_and(|download| download.path == path)
+    }
+
+    fn hf_token(&self) -> Option<&str> {
+        let token = self.settings.hf_token.trim();
+        if token.is_empty() {
+            None
+        } else {
+            Some(token)
+        }
+    }
+
+    fn start_hf_search(&mut self) {
+        if self.hf_searching {
+            return;
+        }
+        let query = self.hf_query.trim().to_string();
+        if query.is_empty() {
+            self.hf_error = Some("Введите поисковый запрос".to_string());
+            return;
+        }
+        self.hf_searching = true;
+        self.hf_error = None;
+        let (tx, rx) = mpsc::channel();
+        let token = self.hf_token().map(str::to_string);
+        let _ = std::thread::Builder::new()
+            .name("hf-search".into())
+            .spawn(move || {
+                let result = huggingface::search_models(&query, token.as_deref())
+                    .map_err(|e| format!("{e:#}"));
+                let _ = tx.send(result);
+            });
+        self.hf_search_rx = Some(rx);
+    }
+
+    fn poll_hf_search(&mut self) {
+        let received = self.hf_search_rx.as_ref().map(|rx| rx.try_recv());
+        match received {
+            Some(Ok(Ok(models))) => {
+                self.hf_results = Some(models);
+                self.hf_search_rx = None;
+                self.hf_searching = false;
+            }
+            Some(Ok(Err(message))) => {
+                self.hf_error = Some(message.clone());
+                self.hf_search_rx = None;
+                self.hf_searching = false;
+                log::warn!("Поиск HuggingFace не удался: {message}");
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) => {}
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.hf_search_rx = None;
+                self.hf_searching = false;
+            }
+            None => {}
+        }
+    }
+
+    fn select_hf_repo(&mut self, repo: String) {
+        if self.hf_selected_repo.as_deref() == Some(repo.as_str()) {
+            return;
+        }
+        self.hf_selected_repo = Some(repo.clone());
+        self.hf_files.clear();
+        self.hf_files_rx = None;
+        let (tx, rx) = mpsc::channel();
+        let token = self.hf_token().map(str::to_string);
+        let _ = std::thread::Builder::new()
+            .name("hf-files".into())
+            .spawn(move || {
+                let result = huggingface::list_gguf_files(&repo, token.as_deref())
+                    .map_err(|e| format!("{e:#}"));
+                let _ = tx.send(result);
+            });
+        self.hf_files_rx = Some(rx);
+    }
+
+    fn poll_hf_files(&mut self) {
+        let received = self.hf_files_rx.as_ref().map(|rx| rx.try_recv());
+        match received {
+            Some(Ok(Ok(files))) => {
+                self.hf_files = files;
+                self.hf_files_rx = None;
+            }
+            Some(Ok(Err(message))) => {
+                self.hf_error = Some(message.clone());
+                self.hf_files_rx = None;
+                log::warn!("Не удалось получить файлы модели: {message}");
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) => {}
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.hf_files_rx = None;
+            }
+            None => {}
+        }
+    }
+
+    fn start_model_download(&mut self, repo: String, file: huggingface::HfFile) {
+        if self.model_download.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let dest = self.settings.models_dir.join(&file.path);
+        let token = self.hf_token().map(str::to_string);
+        let thread_repo = repo.clone();
+        let thread_path = file.path.clone();
+        let _ = std::thread::Builder::new()
+            .name("model-download".into())
+            .spawn(move || {
+                let outcome = huggingface::download_model_file(
+                    &thread_repo,
+                    &thread_path,
+                    &dest,
+                    token.as_deref(),
+                    |downloaded, total| {
+                        let _ = tx.send(ModelDownloadMsg::Progress(downloaded, total));
+                    },
+                )
+                .map_err(|e| format!("{e:#}"));
+                let _ = tx.send(ModelDownloadMsg::Done(outcome));
+            });
+        log::info!("Начато скачивание модели {repo}/{}", file.path);
+        self.model_download = Some(ModelDownload {
+            repo,
+            path: file.path,
+            downloaded: 0,
+            total: file.size,
+            rx,
+            error: None,
+        });
+    }
+
+    /// Подобрать сообщения из фонового потока скачивания модели.
+    /// Успех убирает панель (файл появляется в библиотеке ниже).
+    fn poll_model_download(&mut self) {
+        let mut succeeded = false;
+        {
+            let Some(download) = self.model_download.as_mut() else {
+                return;
+            };
+            loop {
+                match download.rx.try_recv() {
+                    Ok(ModelDownloadMsg::Progress(downloaded, total)) => {
+                        download.downloaded = downloaded;
+                        if total > 0 {
+                            download.total = total;
+                        }
+                    }
+                    Ok(ModelDownloadMsg::Done(Ok(()))) => {
+                        log::info!("Модель {}/{} скачана", download.repo, download.path);
+                        succeeded = true;
+                        break;
+                    }
+                    Ok(ModelDownloadMsg::Done(Err(message))) => {
+                        download.error = Some(message.clone());
+                        log::error!("Не удалось скачать модель: {message}");
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        if download.error.is_none() {
+                            download.error =
+                                Some("поток скачивания завершился без результата".into());
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        if succeeded {
+            self.model_download = None;
+        }
     }
 
     fn builds_page(&mut self, ui: &mut egui::Ui) {
@@ -1915,10 +2305,38 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
+/// GGUF-файлы в библиотеке моделей (в каталоге и на один уровень вглубь),
+/// отсортированные по имени.
+fn library_models(models_dir: &std::path::Path) -> Vec<PathBuf> {
+    fn gguf(p: &std::path::Path) -> bool {
+        p.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("gguf")) == Some(true)
+    }
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(models_dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() && gguf(&path) {
+            out.push(path);
+        } else if path.is_dir()
+            && let Ok(nested) = std::fs::read_dir(&path)
+        {
+            for sub in nested.flatten() {
+                let sub_path = sub.path();
+                if sub_path.is_file() && gguf(&sub_path) {
+                    out.push(sub_path);
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 /// Обрезать список ассетов до первых `max_tags` разных тегов релизов
 /// (релизы идут от новых к старым).
-fn limit_releases(assets: Vec<github::BuildAsset>, max_tags: usize) -> Vec<github::BuildAsset> {
-    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+fn limit_releases(assets: Vec<github::BuildAsset>, max_tags: usize) -> Vec<github::BuildAsset> {    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     assets
         .into_iter()
         .filter(|asset| {
