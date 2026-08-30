@@ -17,9 +17,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "LlamaCpp Manager",
         options,
-        Box::new(|cc| {
-            theme::apply(&cc.egui_ctx);
-            Ok(Box::new(App::new()))
-        }),
+        Box::new(|_cc| Ok(Box::new(App::new()))),
     )
 }
