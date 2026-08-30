@@ -45,8 +45,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 .collect()
         })
         .unwrap_or_default();
-    ScrollArea::vertical()
+    ScrollArea::both()
         .id_salt("server_log_full")
+        .auto_shrink([false, false])
         .stick_to_bottom(true)
         .show(ui, |ui| {
             ui.set_min_height(server_height);
@@ -109,8 +110,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             )
         })
         .collect();
-    ScrollArea::vertical()
+    ScrollArea::both()
         .id_salt("app_log_full")
+        .auto_shrink([false, false])
         .stick_to_bottom(true)
         .show(ui, |ui| {
             ui.set_min_height(app_log_height - 8.0);

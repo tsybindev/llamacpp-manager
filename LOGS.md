@@ -4,6 +4,9 @@
 - Этап 9: полировка UI — визуальная проверка после второго раунда правок
 
 ## [x] Completed
+- 2026-08-31 02:40 — Фикс страницы «Логи» + релизная инфраструктура:
+  - Журнал llama-server и приложения теперь на всю ширину (ScrollArea auto_shrink=false) с вертикальной и горизонтальной прокруткой (ScrollArea::both, stick_to_bottom сохранён).
+  - `.github/workflows/release.yml`: по тегу v* собираются релизные ассеты для Linux x64 (tar.gz, ubuntu-22.04) и Windows x64 (zip, windows-latest) и прикрепляются к GitHub Release (softprops/action-gh-release).
 - 2026-08-31 02:00 — Каталог параметров v2: сверка с llama-server b10690 (--help):
   - Прогон help установленной сборки (732 строки) против каталога. Добавлен reasoning/thinking-набор: --reasoning (on/off/auto), --reasoning-effort (minimal..max), --reasoning-budget (-1/0/N токенов), --reasoning-format (none/deepseek/deepseek-legacy), --reasoning-preserve, --chat-template — в новую категорию chat и отдельную вкладку «Чат и reasoning».
   - Дробный сэмплинг (kind=float с диапазонами): typical, top-n-sigma, xtc-probability/xtc-threshold, presence/frequency-penalty, dry-multiplier/dry-base, dynatemp-range/exp, mirostat-lr/ent; целые: mirostat, dry-allowed-length, dry-penalty-last-n; ignore-eos (bool). DragValue для float получил max_decimals(2).
@@ -176,6 +179,9 @@
 - [ ] Кнопки «открыть в браузере», «копировать адрес API»
 
 ## [x] Completed
+- 2026-08-31 02:40 — Фикс страницы «Логи» + релизная инфраструктура:
+  - Журнал llama-server и приложения теперь на всю ширину (ScrollArea auto_shrink=false) с вертикальной и горизонтальной прокруткой (ScrollArea::both, stick_to_bottom сохранён).
+  - `.github/workflows/release.yml`: по тегу v* собираются релизные ассеты для Linux x64 (tar.gz, ubuntu-22.04) и Windows x64 (zip, windows-latest) и прикрепляются к GitHub Release (softprops/action-gh-release).
 - 2026-08-31 02:00 — Каталог параметров v2: сверка с llama-server b10690 (--help):
   - Прогон help установленной сборки (732 строки) против каталога. Добавлен reasoning/thinking-набор: --reasoning (on/off/auto), --reasoning-effort (minimal..max), --reasoning-budget (-1/0/N токенов), --reasoning-format (none/deepseek/deepseek-legacy), --reasoning-preserve, --chat-template — в новую категорию chat и отдельную вкладку «Чат и reasoning».
   - Дробный сэмплинг (kind=float с диапазонами): typical, top-n-sigma, xtc-probability/xtc-threshold, presence/frequency-penalty, dry-multiplier/dry-base, dynatemp-range/exp, mirostat-lr/ent; целые: mirostat, dry-allowed-length, dry-penalty-last-n; ignore-eos (bool). DragValue для float получил max_decimals(2).

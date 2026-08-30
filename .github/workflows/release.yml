@@ -1,0 +1,48 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            archive: llamacpp-manager-${{ github.ref_name }}-linux-x64.tar.gz
+          - os: windows-latest
+            archive: llamacpp-manager-${{ github.ref_name }}-windows-x64.zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cd target/release
+          tar czf "../../${{ matrix.archive }}" llamacpp-manager
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target/release/llamacpp-manager.exe -DestinationPath "${{ matrix.archive }}"
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.archive }}
