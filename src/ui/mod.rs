@@ -461,7 +461,7 @@ pub fn param_row(
                         let min = def.min.unwrap_or(f64::MIN);
                         let max = def.max.unwrap_or(f64::MAX);
                         let mut v = value.and_then(|x| x.as_f64()).unwrap_or(min.max(0.0));
-                        if ui.add_sized([130.0, 20.0], egui::DragValue::new(&mut v).range(min..=max).speed(0.05)).on_hover_text(&tooltip).changed() {
+                        if ui.add_sized([130.0, 20.0], egui::DragValue::new(&mut v).range(min..=max).speed(0.05).max_decimals(2)).on_hover_text(&tooltip).changed() {
                             Some(serde_json::json!(v))
                         } else {
                             None
@@ -605,11 +605,12 @@ pub fn short_path(path: &std::path::Path, max_components: usize) -> String {
 
 /// Категории каталога параметров, сведённые к вкладкам экрана Сервера:
 /// (вкладка, [категории]).
-pub fn param_tabs() -> [(&'static str, &'static [&'static str]); 4] {
+pub fn param_tabs() -> [(&'static str, &'static [&'static str]); 5] {
     [
         ("Основные", &["context"]),
         ("GPU и память", &["gpu", "kv"]),
         ("Draft (спекуляция)", &["spec"]),
+        ("Чат и reasoning", &["chat"]),
         ("Дополнительно", &["sampling", "server"]),
     ]
 }

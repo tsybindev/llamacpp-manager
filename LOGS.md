@@ -4,6 +4,12 @@
 - Этап 9: полировка UI — визуальная проверка после второго раунда правок
 
 ## [x] Completed
+- 2026-08-31 02:00 — Каталог параметров v2: сверка с llama-server b10690 (--help):
+  - Прогон help установленной сборки (732 строки) против каталога. Добавлен reasoning/thinking-набор: --reasoning (on/off/auto), --reasoning-effort (minimal..max), --reasoning-budget (-1/0/N токенов), --reasoning-format (none/deepseek/deepseek-legacy), --reasoning-preserve, --chat-template — в новую категорию chat и отдельную вкладку «Чат и reasoning».
+  - Дробный сэмплинг (kind=float с диапазонами): typical, top-n-sigma, xtc-probability/xtc-threshold, presence/frequency-penalty, dry-multiplier/dry-base, dynatemp-range/exp, mirostat-lr/ent; целые: mirostat, dry-allowed-length, dry-penalty-last-n; ignore-eos (bool). DragValue для float получил max_decimals(2).
+  - Прочее: --keep, --spec-draft-threads, --threads-http; spec-draft-n-max default 1 → 3 (как в llama.cpp).
+  - Уточнение по «0.5 у драфта»: spec-draft-n-min/n-max — целые (число токенов по спецификации llama.cpp), дробные значения относятся к сэмплингу (temp, top-p, min-p, xtc, penalties и др.) — они теперь в каталоге с корректными float-типами и диапазонами.
+  - Живой прогон: все новые флаги парсятся установленным llama-server без ошибок. cargo test 38 passed, clippy чисто, smoke ок. Версия каталога 2 (bundled перекрывает удалённый v1).
 - 2026-08-31 01:30 — Фикс: не работали чекбоксы параметров на странице «Сервер»:
   - Причина: при переносе param_row в ui/mod.rs потерялась запись результата чекбокса в состояние (`state.set(id, enabled)`) для не-bool параметров — галочка откатывалась в следующем кадре, а включённые по умолчанию параметры (enabled_default) оставались в команде запуска.
   - Исправление: `ui.checkbox(...).changed()` → `state.set(&def.id, enabled)`; включение/выключение параметра сразу отражается в CLI-предпросмотре и автосохраняется. cargo test 38 passed, clippy чисто, smoke ок.
@@ -170,6 +176,12 @@
 - [ ] Кнопки «открыть в браузере», «копировать адрес API»
 
 ## [x] Completed
+- 2026-08-31 02:00 — Каталог параметров v2: сверка с llama-server b10690 (--help):
+  - Прогон help установленной сборки (732 строки) против каталога. Добавлен reasoning/thinking-набор: --reasoning (on/off/auto), --reasoning-effort (minimal..max), --reasoning-budget (-1/0/N токенов), --reasoning-format (none/deepseek/deepseek-legacy), --reasoning-preserve, --chat-template — в новую категорию chat и отдельную вкладку «Чат и reasoning».
+  - Дробный сэмплинг (kind=float с диапазонами): typical, top-n-sigma, xtc-probability/xtc-threshold, presence/frequency-penalty, dry-multiplier/dry-base, dynatemp-range/exp, mirostat-lr/ent; целые: mirostat, dry-allowed-length, dry-penalty-last-n; ignore-eos (bool). DragValue для float получил max_decimals(2).
+  - Прочее: --keep, --spec-draft-threads, --threads-http; spec-draft-n-max default 1 → 3 (как в llama.cpp).
+  - Уточнение по «0.5 у драфта»: spec-draft-n-min/n-max — целые (число токенов по спецификации llama.cpp), дробные значения относятся к сэмплингу (temp, top-p, min-p, xtc, penalties и др.) — они теперь в каталоге с корректными float-типами и диапазонами.
+  - Живой прогон: все новые флаги парсятся установленным llama-server без ошибок. cargo test 38 passed, clippy чисто, smoke ок. Версия каталога 2 (bundled перекрывает удалённый v1).
 - 2026-08-31 01:30 — Фикс: не работали чекбоксы параметров на странице «Сервер»:
   - Причина: при переносе param_row в ui/mod.rs потерялась запись результата чекбокса в состояние (`state.set(id, enabled)`) для не-bool параметров — галочка откатывалась в следующем кадре, а включённые по умолчанию параметры (enabled_default) оставались в команде запуска.
   - Исправление: `ui.checkbox(...).changed()` → `state.set(&def.id, enabled)`; включение/выключение параметра сразу отражается в CLI-предпросмотре и автосохраняется. cargo test 38 passed, clippy чисто, smoke ок.

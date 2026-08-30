@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "updated_at": "2026-08-30",
   "source": "bundled",
   "params": [
@@ -97,6 +97,80 @@
       "enabled_default": true
     },
     {
+      "id": "reasoning",
+      "flag": "--reasoning",
+      "short": "-rea",
+      "name": "Thinking (рассуждения)",
+      "description": "Использовать reasoning/thinking в чате: on — включить, off — выключить, auto — определять по шаблону модели.",
+      "category": "chat",
+      "kind": "enum",
+      "options": [
+        "on",
+        "off",
+        "auto"
+      ],
+      "default": "auto"
+    },
+    {
+      "id": "reasoning-effort",
+      "flag": "--reasoning-effort",
+      "name": "Уровень размышления (effort)",
+      "description": "Уровень усилий размышления для шаблона: default — как в шаблоне, иначе minimal/low/medium/high/xhigh/max.",
+      "category": "chat",
+      "kind": "enum",
+      "options": [
+        "default",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default": "default"
+    },
+    {
+      "id": "reasoning-budget",
+      "flag": "--reasoning-budget",
+      "name": "Бюджет thinking (токенов)",
+      "description": "Бюджет токенов на размышления: -1 — не ограничен, 0 — завершать thinking сразу, N — лимит токенов.",
+      "category": "chat",
+      "kind": "int",
+      "default": -1,
+      "min": -1,
+      "max": 65536
+    },
+    {
+      "id": "reasoning-format",
+      "flag": "--reasoning-format",
+      "name": "Формат reasoning в ответе",
+      "description": "Разбор thought-тегов в ответе: none — оставить <think> в content, deepseek — вынести в message.reasoning_content, deepseek-legacy — оба.",
+      "category": "chat",
+      "kind": "enum",
+      "options": [
+        "none",
+        "deepseek",
+        "deepseek-legacy"
+      ],
+      "default": "none"
+    },
+    {
+      "id": "reasoning-preserve",
+      "flag": "--reasoning-preserve",
+      "name": "Сохранять reasoning в истории",
+      "description": "Хранить reasoning-трейс во всей истории диалога, а не только в последнем сообщении ассистента. Зависит от поддержки шаблоном.",
+      "category": "chat",
+      "kind": "bool"
+    },
+    {
+      "id": "chat-template",
+      "flag": "--chat-template",
+      "name": "Свой Jinja-шаблон чата",
+      "description": "Переопределить chat-шаблон (имя встроенного или полный Jinja). Требует включённых Jinja-шаблонов.",
+      "category": "chat",
+      "kind": "string"
+    },
+    {
       "id": "cache-prompt",
       "flag": "--cache-prompt",
       "name": "Кэш промпта",
@@ -125,7 +199,11 @@
       "description": "Flash Attention: on — включить (быстрее, меньше память под KV), off — выключить, auto — на усмотрение llama.cpp.",
       "category": "context",
       "kind": "enum",
-      "options": ["on", "off", "auto"],
+      "options": [
+        "on",
+        "off",
+        "auto"
+      ],
       "default": "auto",
       "enabled_default": true
     },
@@ -157,7 +235,12 @@
       "description": "Как делить модель между несколькими GPU: none — один GPU, layer — по слоям (по умолчанию), row — по строкам, tensor — по тензорам (экспериментально).",
       "category": "gpu",
       "kind": "enum",
-      "options": ["none", "layer", "row", "tensor"],
+      "options": [
+        "none",
+        "layer",
+        "row",
+        "tensor"
+      ],
       "default": "layer"
     },
     {
@@ -234,7 +317,17 @@
       "description": "Тип данных K-кэша. Квантованные типы (q4_0, q8_0) экономят память. Требует Flash Attention для V-квантования.",
       "category": "kv",
       "kind": "enum",
-      "options": ["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"],
+      "options": [
+        "f32",
+        "f16",
+        "bf16",
+        "q8_0",
+        "q4_0",
+        "q4_1",
+        "iq4_nl",
+        "q5_0",
+        "q5_1"
+      ],
       "default": "f16"
     },
     {
@@ -245,7 +338,17 @@
       "description": "Тип данных V-кэша. Квантование V требует Flash Attention (on).",
       "category": "kv",
       "kind": "enum",
-      "options": ["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"],
+      "options": [
+        "f32",
+        "f16",
+        "bf16",
+        "q8_0",
+        "q4_0",
+        "q4_1",
+        "iq4_nl",
+        "q5_0",
+        "q5_1"
+      ],
       "default": "f16"
     },
     {
@@ -255,7 +358,19 @@
       "description": "Метод ускорения генерации. draft-mtp — для MTP-моделей (Gemma), draft-eagle3 — EAGLE, ngram-* — без второй модели, none — выключено.",
       "category": "spec",
       "kind": "enum",
-      "options": ["none", "draft-simple", "draft-eagle3", "draft-mtp", "draft-dflash", "draft-dspark", "ngram-simple", "ngram-map-k", "ngram-map-k4v", "ngram-mod", "ngram-cache"],
+      "options": [
+        "none",
+        "draft-simple",
+        "draft-eagle3",
+        "draft-mtp",
+        "draft-dflash",
+        "draft-dspark",
+        "ngram-simple",
+        "ngram-map-k",
+        "ngram-map-k4v",
+        "ngram-mod",
+        "ngram-cache"
+      ],
       "default": "draft-mtp"
     },
     {
@@ -283,7 +398,7 @@
       "description": "Сколько токенов максимум черновика за шаг. Для MTP обычно 1.",
       "category": "spec",
       "kind": "int",
-      "default": 1,
+      "default": 3,
       "min": 0,
       "max": 64
     },
@@ -318,7 +433,17 @@
       "description": "Тип данных K-кэша draft-модели.",
       "category": "spec",
       "kind": "enum",
-      "options": ["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"],
+      "options": [
+        "f32",
+        "f16",
+        "bf16",
+        "q8_0",
+        "q4_0",
+        "q4_1",
+        "iq4_nl",
+        "q5_0",
+        "q5_1"
+      ],
       "default": "f16"
     },
     {
@@ -329,7 +454,17 @@
       "description": "Тип данных V-кэша draft-модели.",
       "category": "spec",
       "kind": "enum",
-      "options": ["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"],
+      "options": [
+        "f32",
+        "f16",
+        "bf16",
+        "q8_0",
+        "q4_0",
+        "q4_1",
+        "iq4_nl",
+        "q5_0",
+        "q5_1"
+      ],
       "default": "f16"
     },
     {
