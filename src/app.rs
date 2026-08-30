@@ -91,7 +91,7 @@ pub struct App {
 /// Message from the background build download thread.
 enum BuildDownloadMsg {
     Progress(builds::Progress),
-    Done(Result<builds::InstalledBuild, String>),
+    Done(Result<(), String>),
 }
 
 /// Состояние скачивания и установки одной сборки llama.cpp.
@@ -101,10 +101,9 @@ struct BuildDownload {
     total: u64,
     extracting: bool,
     rx: mpsc::Receiver<BuildDownloadMsg>,
-    /// Установленная сборка (после успешного завершения).
-    installed: Option<builds::InstalledBuild>,
-    /// Результат: (успех, сообщение для UI).
-    result: Option<(bool, String)>,
+    /// Результат при ошибке (при успехе скачивание убирается сразу —
+    /// сборка появляется в списке «Установленные сборки»).
+    error: Option<String>,
 }
 
 /// Editable server launch parameters (will become presets in a later stage).
@@ -1133,28 +1132,34 @@ impl App {
                 ui.horizontal(|ui| {
                     let already_installed = store.dir_for(asset).is_dir();
                     let size = format_size(asset.asset.size);
-                    let mut text = format!("{} · {}", asset.backend.label(), size);
-                    if already_installed {
-                        text.push_str("  ✓");
-                    }
-                    let tooltip = format!(
-                        "{}{}\nСкачать и установить в библиотеку сборок",
-                        asset.asset.name,
-                        if already_installed {
-                            " (уже установлена — будет заменена)"
-                        } else {
-                            ""
-                        }
-                    );
+                    let text = format!("{} · {}", asset.backend.label(), size);
+                    let tooltip = if already_installed {
+                        format!(
+                            "{}\nУже установлена — нажатие скачает и заменит её заново",
+                            asset.asset.name
+                        )
+                    } else {
+                        format!(
+                            "{}\nСкачать и установить в библиотеку сборок",
+                            asset.asset.name
+                        )
+                    };
                     if ui
                         .add_enabled(
-                            self.build_download.is_none(),
+                            !self.is_downloading(&asset.asset.name),
                             egui::Button::new(text),
                         )
                         .on_hover_text(tooltip)
                         .clicked()
                     {
                         self.start_build_download(asset.clone());
+                    }
+                    if already_installed {
+                        ui.label(
+                            RichText::new("установлена")
+                                .small()
+                                .color(theme::OK_GREEN),
+                        );
                     }
                 });
             }
@@ -1173,7 +1178,7 @@ impl App {
                             ui.label(RichText::new(format_size(asset.size)).small().weak());
                             if ui
                                 .add_enabled(
-                                    self.build_download.is_none(),
+                                    !self.is_downloading(&asset.name),
                                     egui::Button::new("Скачать"),
                                 )
                                 .on_hover_text(format!("Релиз {tag}\n{}", asset.browser_download_url))
@@ -1232,27 +1237,23 @@ impl App {
         out
     }
 
-    /// Панель прогресса и результата текущего скачивания сборки.
+    /// Панель прогресса текущего скачивания сборки; остаётся на экране
+    /// только при ошибке (при успехе сборка сразу появляется в списке
+    /// «Установленные сборки»).
     fn build_download_panel(&mut self, ui: &mut egui::Ui) {
         let mut clear_download = false;
-        let mut activate: Option<(String, PathBuf)> = None;
         if let Some(download) = self.build_download.as_mut() {
             ui.group(|ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(&download.asset.asset.name).strong());
-                    if let Some((is_error, message)) = &download.result {
-                        let color = if *is_error {
-                            theme::ERR_RED
-                        } else {
-                            theme::OK_GREEN
-                        };
-                        ui.label(RichText::new(message).color(color));
+                    if let Some(error) = &download.error {
+                        ui.label(RichText::new(error).color(theme::ERR_RED));
                         if ui.small_button("Скрыть").clicked() {
                             clear_download = true;
                         }
                     }
                 });
-                if download.result.is_none() {
+                if download.error.is_none() {
                     if download.extracting {
                         ui.horizontal(|ui| {
                             ui.add(egui::Spinner::new().size(14.0));
@@ -1280,20 +1281,20 @@ impl App {
                             total
                         ));
                     }
-                } else if let Some(build) = &download.installed
-                    && let Some(bin) = build.server_binary()
-                    && ui.small_button("Сделать бинарником сервера").clicked()
-                {
-                    activate = Some((build.tag.clone(), bin));
                 }
             });
         }
         if clear_download {
             self.build_download = None;
         }
-        if let Some((tag, bin)) = activate {
-            self.activate_build_binary(tag, bin);
-        }
+    }
+
+    /// Загружается ли сейчас указанный архив (кнопку этой сборки блокируем,
+    /// остальные остаются доступны).
+    fn is_downloading(&self, asset_name: &str) -> bool {
+        self.build_download
+            .as_ref()
+            .is_some_and(|download| download.asset.asset.name == asset_name)
     }
 
     /// Запустить фоновую загрузку списка релизов (с кэшем на сутки).
@@ -1358,7 +1359,7 @@ impl App {
                     let _ = tx.send(BuildDownloadMsg::Progress(progress));
                 });
                 let _ = tx.send(BuildDownloadMsg::Done(
-                    outcome.map_err(|e| format!("{e:#}")),
+                    outcome.map(|_| ()).map_err(|e| format!("{e:#}")),
                 ));
             });
         log::info!("Начато скачивание сборки {tag}: {name}");
@@ -1368,50 +1369,55 @@ impl App {
             total: size,
             extracting: false,
             rx,
-            installed: None,
-            result: None,
+            error: None,
         });
     }
 
     /// Подобрать сообщения из фонового потока скачивания сборки.
+    /// Успех убирает скачивание с экрана (сборка видна в «Установленных»).
     fn poll_build_download(&mut self) {
-        let Some(download) = self.build_download.as_mut() else {
-            return;
-        };
-        loop {
-            match download.rx.try_recv() {
-                Ok(BuildDownloadMsg::Progress(builds::Progress::Downloading {
-                    downloaded,
-                    total,
-                })) => {
-                    download.downloaded = downloaded;
-                    if total > 0 {
-                        download.total = total;
+        let mut succeeded = false;
+        {
+            let Some(download) = self.build_download.as_mut() else {
+                return;
+            };
+            loop {
+                match download.rx.try_recv() {
+                    Ok(BuildDownloadMsg::Progress(builds::Progress::Downloading {
+                        downloaded,
+                        total,
+                    })) => {
+                        download.downloaded = downloaded;
+                        if total > 0 {
+                            download.total = total;
+                        }
                     }
-                }
-                Ok(BuildDownloadMsg::Progress(builds::Progress::Extracting)) => {
-                    download.extracting = true;
-                }
-                Ok(BuildDownloadMsg::Done(Ok(build))) => {
-                    log::info!("Сборка {} установлена", build.label());
-                    download.installed = Some(build);
-                    download.result = Some((false, "Установлена".to_string()));
-                    break;
-                }
-                Ok(BuildDownloadMsg::Done(Err(message))) => {
-                    download.result = Some((true, message.clone()));
-                    log::error!("Не удалось установить сборку: {message}");
-                    break;
-                }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    if download.result.is_none() {
-                        download.result =
-                            Some((true, "поток скачивания завершился без результата".into()));
+                    Ok(BuildDownloadMsg::Progress(builds::Progress::Extracting)) => {
+                        download.extracting = true;
                     }
-                    break;
+                    Ok(BuildDownloadMsg::Done(Ok(()))) => {
+                        log::info!("Сборка {} установлена", download.asset.asset.name);
+                        succeeded = true;
+                        break;
+                    }
+                    Ok(BuildDownloadMsg::Done(Err(message))) => {
+                        download.error = Some(message.clone());
+                        log::error!("Не удалось установить сборку: {message}");
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        if download.error.is_none() {
+                            download.error =
+                                Some("поток скачивания завершился без результата".into());
+                        }
+                        break;
+                    }
                 }
             }
+        }
+        if succeeded {
+            self.build_download = None;
         }
     }
 
