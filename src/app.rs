@@ -179,7 +179,7 @@ impl App {
                 .ok();
         }
 
-        Self {
+        let mut app = Self {
             page: Page::Server,
             sidebar_collapsed: settings.sidebar_collapsed,
             server: ServerManager::new(settings.logs_dir.clone(), settings.auto_restore.clone()),
@@ -197,6 +197,28 @@ impl App {
             log_handle,
             config_dirty: false,
             last_change: None,
+        };
+        app.restore_last_preset();
+        app
+    }
+
+    /// Re-apply the preset selected in the previous session, if it still exists.
+    fn restore_last_preset(&mut self) {
+        let Some(name) = self.settings.last_preset.clone() else {
+            return;
+        };
+        match self.presets.load(&name) {
+            Ok(preset) => {
+                self.apply_preset(preset);
+                self.selected_preset = Some(name.clone());
+                self.mirrored_preset = Some(name.clone());
+                self.preset_name_edit = name;
+                log::info!("Восстановлен последний выбранный пресет");
+            }
+            Err(e) => {
+                self.settings.last_preset = None;
+                log::warn!("Не удалось восстановить последний пресет «{name}»: {e:#}");
+            }
         }
     }
 
@@ -388,11 +410,16 @@ impl App {
             self.selected_preset = None;
             self.preset_delete_armed = false;
         }
-        // Sync the name field whenever the combo box selection changes.
+        // Sync the name field whenever the combo box selection changes,
+        // and remember the selection for the next session.
         if self.selected_preset != self.mirrored_preset {
             self.mirrored_preset = self.selected_preset.clone();
             self.preset_name_edit = self.selected_preset.clone().unwrap_or_default();
             self.preset_delete_armed = false;
+            if self.settings.last_preset != self.selected_preset {
+                self.settings.last_preset = self.selected_preset.clone();
+                self.mark_dirty();
+            }
         }
         let selection = self.selected_preset.clone();
         let has_selection = selection.is_some();
@@ -721,6 +748,7 @@ impl App {
         ui.heading(RichText::new("Параметры llama-server").size(16.0));
         // Sections with draft/MTP and GPU settings are open by default —
         // they are the most-used knobs for this app's audience.
+        let mut params_changed = false;
         for (cat_id, cat_label) in self.params_catalog.categories() {
             let defs: Vec<&ParamDef> = self
                 .params_catalog
@@ -736,34 +764,42 @@ impl App {
                 .default_open(default_open)
                 .show(ui, |ui| {
                     for def in defs {
-                        param_row(ui, def, &mut self.settings.params);
+                        params_changed |= param_row(ui, def, &mut self.settings.params);
                     }
                 });
+        }
+        if params_changed {
+            self.mark_dirty();
         }
         ui.add_space(4.0);
     }
 
     fn server_config_section(&mut self, ui: &mut egui::Ui) {
         ui.heading(RichText::new("Конфигурация").size(16.0));
+        let mut form_changed = false;
         {
             let form = &mut self.server_form;
-            path_row(ui, "Бинарник llama-server", &mut form.binary, "путь к llama-server", PathPick::File);
-            path_row(ui, "Файл модели", &mut form.model, "путь к GGUF-файлу модели", PathPick::File);
+            form_changed |= path_row(ui, "Бинарник llama-server", &mut form.binary, "путь к llama-server", PathPick::File);
+            form_changed |= path_row(ui, "Файл модели", &mut form.model, "путь к GGUF-файлу модели", PathPick::File);
 
             ui.horizontal(|ui| {
                 ui.add_sized([LABEL_WIDTH, 18.0], egui::Label::new("Host"));
-                ui.add(
-                    egui::TextEdit::singleline(&mut form.host)
-                        .desired_width(220.0)
-                        .hint_text("127.0.0.1"),
-                );
+                form_changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut form.host)
+                            .desired_width(220.0)
+                            .hint_text("127.0.0.1"),
+                    )
+                    .changed();
                 ui.label("Порт");
-                ui.add(
-                    egui::DragValue::new(&mut form.port)
-                        .range(1..=65535)
-                        .custom_formatter(|v, _| format!("{}", v as u16))
-                        .custom_parser(|s| s.parse::<u16>().ok().map(f64::from)),
-                );
+                form_changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut form.port)
+                            .range(1..=65535)
+                            .custom_formatter(|v, _| format!("{}", v as u16))
+                            .custom_parser(|s| s.parse::<u16>().ok().map(f64::from)),
+                    )
+                    .changed();
             });
         }
 
@@ -780,12 +816,17 @@ impl App {
 
         ui.add_space(4.0);
         ui.label("Сырые аргументы (сверх каталога)").on_hover_text("Разделяйте пробелом; кавычки поддерживаются. Для флагов, которых нет в каталоге.");
-        ui.add(
-            egui::TextEdit::multiline(&mut self.server_form.extra_args)
-                .desired_rows(2)
-                .desired_width(ui.available_width())
-                .code_editor(),
-        );
+        form_changed |= ui
+            .add(
+                egui::TextEdit::multiline(&mut self.server_form.extra_args)
+                    .desired_rows(2)
+                    .desired_width(ui.available_width())
+                    .code_editor(),
+            )
+            .changed();
+        if form_changed {
+            self.mark_dirty();
+        }
 
         // Parameter validation warnings.
         let problems = params::validate(&self.params_catalog, &self.settings.params);
@@ -1091,7 +1132,9 @@ enum PathPick {
 
 /// One parameter row: enable checkbox + value widget depending on kind.
 /// Non-bool parameters render as `☑ Name [widget……………]` on a single line.
-fn param_row(ui: &mut egui::Ui, def: &ParamDef, state: &mut ParamState) {
+/// Returns true when the parameter state changed during this frame.
+fn param_row(ui: &mut egui::Ui, def: &ParamDef, state: &mut ParamState) -> bool {
+    let before = state.clone();
     let mut tooltip = format!("{}\n\nФлаг: {}", def.description, def.flag);
     if let Some(short) = &def.short {
         tooltip.push_str(&format!(" / {short}"));
@@ -1237,6 +1280,7 @@ fn param_row(ui: &mut egui::Ui, def: &ParamDef, state: &mut ParamState) {
             }
         }
     }
+    before != *state
 }
 
 /// One path picker row: label, editable path, browse button.

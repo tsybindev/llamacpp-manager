@@ -51,6 +51,8 @@ pub struct Settings {
     pub params_catalog_url: String,
     /// Last used parameter values (persisted between runs; presets come later).
     pub params: ParamState,
+    /// Preset selected in the previous session, restored at startup.
+    pub last_preset: Option<String>,
 }
 
 impl Default for Settings {
@@ -69,6 +71,7 @@ impl Default for Settings {
             auto_restore: AutoRestore::default(),
             params_catalog_url: DEFAULT_PARAMS_CATALOG_URL.to_string(),
             params: ParamState::default(),
+            last_preset: None,
         }
     }
 }
