@@ -14,6 +14,7 @@ rfd = "0.17.2"
 serde = "1.0.229"
 serde_json = "1.0.151"
 shlex = "2.0.1"
+ureq = "3.4.0"
 
 [target."cfg(unix)".dependencies]
 libc = "0.2.189"

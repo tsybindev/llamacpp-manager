@@ -5,6 +5,7 @@ use egui::{Color32, RichText, ScrollArea};
 
 use crate::config::{self, Settings};
 use crate::logger::{self, LogHandle, LogEntry};
+use crate::params::{self, ParamDef, ParamKind, ParamsCatalog, ParamState};
 use crate::process_mgr::{ServerConfig, ServerState, ServerManager};
 use crate::theme::{self, ThemeMode};
 
@@ -57,6 +58,9 @@ pub struct App {
     last_change: Option<Instant>,
     server: ServerManager,
     server_form: ServerForm,
+    params_catalog: ParamsCatalog,
+    /// Fresh catalog fetched in the background, picked up on the next frame.
+    catalog_refresh: std::sync::Arc<std::sync::Mutex<Option<ParamsCatalog>>>,
 }
 
 /// Editable server launch parameters (will become presets in a later stage).
@@ -84,13 +88,13 @@ impl Default for ServerForm {
 }
 
 impl ServerForm {
-    fn to_config(&self) -> ServerConfig {
+    fn to_config(&self, extra_args: Vec<String>) -> ServerConfig {
         ServerConfig {
             binary: self.binary.clone(),
             model: self.model.clone(),
             host: self.host.trim().to_string(),
             port: self.port,
-            extra_args: shlex::split(&self.extra_args).unwrap_or_default(),
+            extra_args,
         }
     }
 }
@@ -123,11 +127,45 @@ impl App {
         }
         log::debug!("Debug-логирование: {}", if settings.debug_logging { "включено" } else { "выключено" });
 
+        let params_catalog = params::bundled_catalog();
+        let mut settings = settings;
+        settings.params.merge_defaults(&params_catalog);
+
+        // Background catalog refresh: bundled catalog first, remote applied
+        // when its version is newer.
+        let catalog_refresh = std::sync::Arc::new(std::sync::Mutex::new(None));
+        {
+            let pending = catalog_refresh.clone();
+            let url = settings.params_catalog_url.clone();
+            let current_version = params_catalog.version;
+            std::thread::Builder::new()
+                .name("catalog-refresh".into())
+                .spawn(move || match params::fetch_catalog(&url) {
+                    Ok(remote) if remote.version > current_version => {
+                        log::info!(
+                            "Найдено обновление каталога параметров: версия {current_version} → {}",
+                            remote.version
+                        );
+                        if let Ok(mut guard) = pending.lock() {
+                            *guard = Some(remote);
+                        }
+                    }
+                    Ok(remote) => {
+                        log::debug!("Каталог параметров актуален (версия {})", remote.version);
+                        let _ = remote;
+                    }
+                    Err(e) => log::debug!("Каталог параметров оставлен без изменений: {e}"),
+                })
+                .ok();
+        }
+
         Self {
             page: Page::Server,
             sidebar_collapsed: settings.sidebar_collapsed,
             server: ServerManager::new(settings.logs_dir.clone(), settings.auto_restore.clone()),
             server_form: ServerForm::default(),
+            params_catalog,
+            catalog_refresh,
             settings,
             applied_theme: None,
             log_handle,
@@ -300,25 +338,55 @@ impl App {
         }
     }
 
+    fn build_extra_args(&self) -> Vec<String> {
+        let mut args = params::to_args(&self.params_catalog, &self.settings.params);
+        if let Some(raw) = shlex::split(&self.server_form.extra_args) {
+            args.extend(raw);
+        }
+        args
+    }
+
+    /// Parameter catalog UI grouped by category.
+    fn params_section(&mut self, ui: &mut egui::Ui) {
+        ui.heading(RichText::new("Параметры llama-server").size(16.0));
+        // Sections with draft/MTP and GPU settings are open by default —
+        // they are the most-used knobs for this app's audience.
+        for (cat_id, cat_label) in self.params_catalog.categories() {
+            let defs: Vec<&ParamDef> = self
+                .params_catalog
+                .params
+                .iter()
+                .filter(|p| p.category == cat_id)
+                .collect();
+            if defs.is_empty() {
+                continue;
+            }
+            let default_open = matches!(cat_id, "context" | "gpu" | "spec");
+            egui::CollapsingHeader::new(RichText::new(cat_label).size(14.0))
+                .default_open(default_open)
+                .show(ui, |ui| {
+                    for def in defs {
+                        param_row(ui, def, &mut self.settings.params);
+                    }
+                });
+        }
+        ui.add_space(4.0);
+    }
+
     fn server_config_section(&mut self, ui: &mut egui::Ui) {
         ui.heading(RichText::new("Конфигурация").size(16.0));
-        let mut paths_changed = false;
-        egui::Grid::new("server_grid")
-            .num_columns(3)
-            .spacing([12.0, 8.0])
-            .show(ui, |ui| {
-                let form = &mut self.server_form;
-                paths_changed |= path_row(ui, "Бинарник llama-server", &mut form.binary, "путь к llama-server");
-                paths_changed |= path_row(ui, "Файл модели", &mut form.model, "путь к GGUF-файлу модели");
-                ui.label("Host").on_hover_text("127.0.0.1 — только локально; 0.0.0.0 — доступ из сети (опасно!)");
-                let host_response = ui.add(
-                    egui::TextEdit::singleline(&mut form.host).desired_width(160.0),
+        {
+            let form = &mut self.server_form;
+            path_row(ui, "Бинарник llama-server", &mut form.binary, "путь к llama-server", PathPick::File);
+            path_row(ui, "Файл модели", &mut form.model, "путь к GGUF-файлу модели", PathPick::File);
+
+            ui.horizontal(|ui| {
+                ui.add_sized([LABEL_WIDTH, 18.0], egui::Label::new("Host"));
+                ui.add(
+                    egui::TextEdit::singleline(&mut form.host)
+                        .desired_width(220.0)
+                        .hint_text("127.0.0.1"),
                 );
-                if host_response.changed() {
-                    // normalise on leave only; keep raw while typing
-                }
-                ui.label("");
-                ui.end_row();
                 ui.label("Порт");
                 ui.add(
                     egui::DragValue::new(&mut form.port)
@@ -326,11 +394,7 @@ impl App {
                         .custom_formatter(|v, _| format!("{}", v as u16))
                         .custom_parser(|s| s.parse::<u16>().ok().map(f64::from)),
                 );
-                ui.label("");
-                ui.end_row();
             });
-        if paths_changed {
-            // Paths live in the form, not settings — nothing to persist yet.
         }
 
         if self.server_form.host.trim() == "0.0.0.0" {
@@ -342,20 +406,36 @@ impl App {
         }
 
         ui.add_space(4.0);
-        ui.label("Дополнительные аргументы").on_hover_text("Разделяйте пробелом; кавычки поддерживаются. Каталог параметров с описаниями появится позже.");
-        let response = ui.add(
+        self.params_section(ui);
+
+        ui.add_space(4.0);
+        ui.label("Сырые аргументы (сверх каталога)").on_hover_text("Разделяйте пробелом; кавычки поддерживаются. Для флагов, которых нет в каталоге.");
+        ui.add(
             egui::TextEdit::multiline(&mut self.server_form.extra_args)
                 .desired_rows(2)
-                .desired_width(560.0)
+                .desired_width(ui.available_width())
                 .code_editor(),
         );
-        let _ = response;
+
+        // Parameter validation warnings.
+        let problems = params::validate(&self.params_catalog, &self.settings.params);
+        if !problems.is_empty() {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!(
+                    "⚠ Проверка параметров:\n{}",
+                    problems.iter().map(|p| format!("• {p}")).collect::<Vec<_>>().join("\n")
+                ))
+                .small()
+                .color(theme::WARN_YELLOW),
+            );
+        }
 
         ui.add_space(4.0);
         ui.label(
             RichText::new(format!(
                 "Команда запуска:\n{}",
-                self.server_form.to_config().command_line()
+                self.server_form.to_config(self.build_extra_args()).command_line()
             ))
             .monospace()
             .small(),
@@ -368,7 +448,7 @@ impl App {
                 .clicked()
             {
                 self.server_form.last_error = None;
-                let config = self.server_form.to_config();
+                let config = self.server_form.to_config(self.build_extra_args());
                 if let Err(e) = self.pre_flight_check(&config).and_then(|()| self.server.start(config)) {
                     self.server_form.last_error = Some(e);
                 }
@@ -543,17 +623,15 @@ impl App {
         });
         ui.add_space(8.0);
 
+        ui.add_space(12.0);
+        ui.separator();
+        ui.heading(RichText::new("Каталоги").size(16.0));
         let paths_changed = {
+            let s = &mut self.settings;
             let mut changed = false;
-            egui::Grid::new("paths_grid")
-                .num_columns(3)
-                .spacing([12.0, 8.0])
-                .show(ui, |ui| {
-                    let s = &mut self.settings;
-                    changed |= path_row(ui, "Каталог моделей", &mut s.models_dir, "куда скачиваются GGUF-модели");
-                    changed |= path_row(ui, "Каталог сборок", &mut s.builds_dir, "куда скачиваются бинарники llama.cpp");
-                    changed |= path_row(ui, "Каталог логов", &mut s.logs_dir, "куда пишутся журналы");
-                });
+            changed |= path_row(ui, "Каталог моделей", &mut s.models_dir, "куда скачиваются GGUF-модели", PathPick::Folder);
+            changed |= path_row(ui, "Каталог сборок", &mut s.builds_dir, "куда скачиваются бинарники llama.cpp", PathPick::Folder);
+            changed |= path_row(ui, "Каталог логов", &mut s.logs_dir, "куда пишутся журналы", PathPick::Folder);
             changed
         };
         if paths_changed {
@@ -568,7 +646,7 @@ impl App {
             egui::TextEdit::singleline(&mut token)
                 .password(true)
                 .hint_text("hf_...")
-                .desired_width(420.0),
+                .desired_width(ui.available_width()),
         );
         if token_response.changed() {
             self.settings.hf_token = token.trim().to_string();
@@ -661,28 +739,197 @@ impl App {
 
 }
 
-/// One "path picker" row: label, editable path, browse button. Returns true if changed.
-fn path_row(ui: &mut egui::Ui, label: &str, path: &mut PathBuf, hint: &str) -> bool {
+/// Minimum width reserved for parameter/path labels before the value widget.
+const LABEL_WIDTH: f32 = 210.0;
+/// Width reserved for the "Обзор…" browse button plus margins.
+const BROWSE_BUTTON_WIDTH: f32 = 88.0;
+
+/// What kind of item the file dialog should let the user pick.
+#[derive(Clone, Copy)]
+enum PathPick {
+    File,
+    Folder,
+}
+
+/// One parameter row: enable checkbox + value widget depending on kind.
+/// Non-bool parameters render as `☑ Name [widget……………]` on a single line.
+fn param_row(ui: &mut egui::Ui, def: &ParamDef, state: &mut ParamState) {
+    let mut tooltip = format!("{}\n\nФлаг: {}", def.description, def.flag);
+    if let Some(short) = &def.short {
+        tooltip.push_str(&format!(" / {short}"));
+    }
+
+    match def.kind {
+        // Bool parameters have no value: the checkbox is the whole control.
+        ParamKind::Bool => {
+            let mut on = state.is_enabled(&def.id);
+            if ui
+                .checkbox(&mut on, &def.name)
+                .on_hover_text(&tooltip)
+                .changed()
+            {
+                state.set(&def.id, on);
+            }
+        }
+        _ => {
+            let new_value = ui
+                .horizontal(|ui| {
+                    let mut enabled = state.is_enabled(&def.id);
+                    ui.checkbox(&mut enabled, &def.name)
+                        .on_hover_text(&tooltip)
+                        .changed()
+                        .then(|| state.set(&def.id, enabled));
+
+                    let value = state
+                        .entries
+                        .get(&def.id)
+                        .and_then(|e| e.value.clone())
+                        .or_else(|| def.default.clone());
+                    let field_width = (ui.available_width() - 8.0).max(120.0);
+
+                    match def.kind {
+                        ParamKind::Int => {
+                            let min = def.min.unwrap_or(i64::MIN as f64) as i64;
+                            let max = def.max.unwrap_or(i64::MAX as f64).min(i64::MAX as f64) as i64;
+                            let mut v = value.and_then(|x| x.as_i64()).unwrap_or(min.max(0));
+                            if ui
+                                .add_sized(
+                                    [110.0, 20.0],
+                                    egui::DragValue::new(&mut v)
+                                        .range(min..=max)
+                                        .custom_formatter(|n, _| format!("{n}"))
+                                        .custom_parser(|s| {
+                                            s.trim().parse::<i64>().ok().map(|n| n as f64)
+                                        }),
+                                )
+                                .on_hover_text(&tooltip)
+                                .changed()
+                            {
+                                return Some(serde_json::json!(v));
+                            }
+                        }
+                        ParamKind::Float => {
+                            let min = def.min.unwrap_or(f64::MIN);
+                            let max = def.max.unwrap_or(f64::MAX);
+                            let mut v = value.and_then(|x| x.as_f64()).unwrap_or(min.max(0.0));
+                            if ui
+                                .add_sized(
+                                    [110.0, 20.0],
+                                    egui::DragValue::new(&mut v)
+                                        .range(min..=max)
+                                        .speed(0.05),
+                                )
+                                .on_hover_text(&tooltip)
+                                .changed()
+                            {
+                                return Some(serde_json::json!(v));
+                            }
+                        }
+                        ParamKind::Enum => {
+                            let previous = value
+                                .as_ref()
+                                .and_then(|x| x.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            let mut current = previous.clone();
+                            egui::ComboBox::from_id_salt(def.id.clone())
+                                .selected_text(current.clone())
+                                .width(150.0)
+                                .show_ui(ui, |ui| {
+                                    for option in &def.options {
+                                        ui.selectable_value(&mut current, option.clone(), option);
+                                    }
+                                })
+                                .response
+                                .on_hover_text(&tooltip);
+                            if current != previous {
+                                return Some(serde_json::json!(current));
+                            }
+                        }
+                        ParamKind::String => {
+                            let mut text = value
+                                .as_ref()
+                                .and_then(|x| x.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut text)
+                                        .desired_width(field_width),
+                                )
+                                .on_hover_text(&tooltip)
+                                .changed()
+                            {
+                                return Some(serde_json::json!(text.trim()));
+                            }
+                        }
+                        ParamKind::Path => {
+                            let mut text = value
+                                .as_ref()
+                                .and_then(|x| x.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            let edit_width = (field_width - BROWSE_BUTTON_WIDTH).max(120.0);
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut text)
+                                        .desired_width(edit_width),
+                                )
+                                .on_hover_text(&tooltip)
+                                .changed()
+                            {
+                                return Some(serde_json::json!(text.trim()));
+                            }
+                            if ui.small_button("Обзор…").clicked() {
+                                if let Some(file) = rfd::FileDialog::new()
+                                    .set_title(format!("Выберите: {}", def.name))
+                                    .pick_file()
+                                {
+                                    return Some(serde_json::json!(file.display().to_string()));
+                                }
+                            }
+                        }
+                        ParamKind::Bool => unreachable!(),
+                    }
+                    None
+                })
+                .inner;
+
+            if let Some(value) = new_value {
+                state.set_value(&def.id, value);
+            }
+        }
+    }
+}
+
+/// One path picker row: label, editable path, browse button.
+/// `pick` selects whether the dialog opens files or folders.
+fn path_row(ui: &mut egui::Ui, label: &str, path: &mut PathBuf, hint: &str, pick: PathPick) -> bool {
     let mut changed = false;
-    ui.label(label).on_hover_text(hint);
-    let mut text = path.display().to_string();
-    let response = ui.add(
-        egui::TextEdit::singleline(&mut text)
-            .desired_width(340.0),
-    );
-    if response.changed() {
-        *path = PathBuf::from(text.trim());
-        changed = true;
-    }
-    if ui.button("Обзор…").clicked()
-        && let Some(dir) = rfd::FileDialog::new()
-            .set_title(format!("Выберите: {label}"))
-            .pick_folder()
-    {
-        *path = dir;
-        changed = true;
-    }
-    ui.end_row();
+    ui.horizontal(|ui| {
+        ui.add_sized([LABEL_WIDTH, 18.0], egui::Label::new(label))
+            .on_hover_text(hint);
+        let mut text = path.display().to_string();
+        let edit_width = (ui.available_width() - BROWSE_BUTTON_WIDTH).max(160.0);
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut text).desired_width(edit_width),
+        );
+        if response.changed() {
+            *path = PathBuf::from(text.trim());
+            changed = true;
+        }
+        let dialog = rfd::FileDialog::new().set_title(format!("Выберите: {label}"));
+        let picked = match pick {
+            PathPick::File => dialog.pick_file(),
+            PathPick::Folder => dialog.pick_folder(),
+        };
+        if ui.button("Обзор…").clicked()
+            && let Some(new_path) = picked
+        {
+            *path = new_path;
+            changed = true;
+        }
+    });
     changed
 }
 
@@ -722,6 +969,18 @@ impl eframe::App for App {
         if self.applied_theme != Some(self.settings.theme) {
             theme::apply(&ui.ctx().clone(), self.settings.theme);
             self.applied_theme = Some(self.settings.theme);
+        }
+
+        // Pick up a catalog fetched in the background, if any.
+        let incoming = self
+            .catalog_refresh
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.take());
+        if let Some(remote) = incoming {
+            self.settings.params.merge_defaults(&remote);
+            self.params_catalog = remote;
+            self.mark_dirty();
         }
 
         // Debounced auto-save: write at most twice per second while editing.

@@ -1,0 +1,458 @@
+{
+  "version": 1,
+  "updated_at": "2026-08-30",
+  "source": "bundled",
+  "params": [
+    {
+      "id": "ctx-size",
+      "flag": "--ctx-size",
+      "short": "-c",
+      "name": "Размер контекста",
+      "description": "Размер окна контекста в токенах. 0 = взять из модели. Влияет на потребление памяти (KV-кэш).",
+      "category": "context",
+      "kind": "int",
+      "default": 8192,
+      "min": 0,
+      "max": 1048576
+    },
+    {
+      "id": "predict",
+      "flag": "--n-predict",
+      "short": "-n",
+      "name": "Токенов на генерацию",
+      "description": "Сколько токенов предсказывать. -1 = без ограничения.",
+      "category": "context",
+      "kind": "int",
+      "default": -1,
+      "min": -1,
+      "max": 1000000
+    },
+    {
+      "id": "parallel",
+      "flag": "--parallel",
+      "short": "-np",
+      "name": "Слотов параллельно",
+      "description": "Количество параллельных слотов (sequence). -1 = автоматически.",
+      "category": "context",
+      "kind": "int",
+      "default": 1,
+      "min": -1,
+      "max": 256
+    },
+    {
+      "id": "batch-size",
+      "flag": "--batch-size",
+      "short": "-b",
+      "name": "Batch size",
+      "description": "Логический максимальный размер батча при обработке промпта.",
+      "category": "context",
+      "kind": "int",
+      "default": 2048,
+      "min": 1,
+      "max": 65536
+    },
+    {
+      "id": "ubatch-size",
+      "flag": "--ubatch-size",
+      "short": "-ub",
+      "name": "Ubatch size",
+      "description": "Физический размер батча (микробатч).",
+      "category": "context",
+      "kind": "int",
+      "default": 512,
+      "min": 1,
+      "max": 65536
+    },
+    {
+      "id": "threads",
+      "flag": "--threads",
+      "short": "-t",
+      "name": "CPU-потоков",
+      "description": "Потоки на генерацию. -1 = автоматически.",
+      "category": "context",
+      "kind": "int",
+      "default": -1,
+      "min": -1,
+      "max": 1024
+    },
+    {
+      "id": "threads-batch",
+      "flag": "--threads-batch",
+      "short": "-tb",
+      "name": "Потоков на батч",
+      "description": "Потоки для обработки промпта. По умолчанию = --threads.",
+      "category": "context",
+      "kind": "int",
+      "default": -1,
+      "min": -1,
+      "max": 1024
+    },
+    {
+      "id": "jinja",
+      "flag": "--jinja",
+      "name": "Jinja-шаблоны чата",
+      "description": "Использовать движок Jinja для чат-шаблона модели. Нужен для tool-calling и reasoning-моделей.",
+      "category": "context",
+      "kind": "bool",
+      "enabled_default": true
+    },
+    {
+      "id": "cache-prompt",
+      "flag": "--cache-prompt",
+      "name": "Кэш промпта",
+      "description": "Кэшировать промпт между запросами (экономит обработку повторов).",
+      "category": "context",
+      "kind": "bool",
+      "enabled_default": true
+    },
+    {
+      "id": "cache-reuse",
+      "flag": "--cache-reuse",
+      "name": "Переиспользование кэша",
+      "description": "Минимальный размер чанка (в токенах) для переиспользования KV-кэша через KV shifting. 0 = выключено.",
+      "category": "context",
+      "kind": "int",
+      "default": 256,
+      "min": 0,
+      "max": 100000,
+      "enabled_default": true
+    },
+    {
+      "id": "flash-attn",
+      "flag": "--flash-attn",
+      "short": "-fa",
+      "name": "Flash Attention",
+      "description": "Flash Attention: on — включить (быстрее, меньше память под KV), off — выключить, auto — на усмотрение llama.cpp.",
+      "category": "context",
+      "kind": "enum",
+      "options": ["on", "off", "auto"],
+      "default": "auto",
+      "enabled_default": true
+    },
+    {
+      "id": "swa-full",
+      "flag": "--swa-full",
+      "name": "Полный SWA-кэш",
+      "description": "Использовать полноразмерный SWA-кэш (для моделей со sliding window attention). Больше памяти.",
+      "category": "context",
+      "kind": "bool"
+    },
+    {
+      "id": "ngl",
+      "flag": "--gpu-layers",
+      "short": "-ngl",
+      "name": "Слоёв в VRAM",
+      "description": "Сколько слоёв модели держать в видеопамяти. 0 — только CPU, 99/999 — вся модель.",
+      "category": "gpu",
+      "kind": "int",
+      "default": 99,
+      "min": 0,
+      "max": 1000
+    },
+    {
+      "id": "split-mode",
+      "flag": "--split-mode",
+      "short": "-sm",
+      "name": "Разделение между GPU",
+      "description": "Как делить модель между несколькими GPU: none — один GPU, layer — по слоям (по умолчанию), row — по строкам, tensor — по тензорам (экспериментально).",
+      "category": "gpu",
+      "kind": "enum",
+      "options": ["none", "layer", "row", "tensor"],
+      "default": "layer"
+    },
+    {
+      "id": "tensor-split",
+      "flag": "--tensor-split",
+      "short": "-ts",
+      "name": "Пропорции по GPU",
+      "description": "Доли модели для каждого GPU через запятую, например 3,1.",
+      "category": "gpu",
+      "kind": "string"
+    },
+    {
+      "id": "main-gpu",
+      "flag": "--main-gpu",
+      "short": "-mg",
+      "name": "Главный GPU",
+      "description": "Индекс GPU для основных вычислений (при split-mode = none).",
+      "category": "gpu",
+      "kind": "int",
+      "default": 0,
+      "min": 0,
+      "max": 15
+    },
+    {
+      "id": "cpu-moe",
+      "flag": "--cpu-moe",
+      "name": "MoE на CPU",
+      "description": "Держать все веса экспертов (MoE) в CPU, attention — в VRAM. Экономит видеопамять для MoE-моделей.",
+      "category": "gpu",
+      "kind": "bool"
+    },
+    {
+      "id": "n-cpu-moe",
+      "flag": "--n-cpu-moe",
+      "short": "-ncmoe",
+      "name": "MoE слоёв на CPU",
+      "description": "Держать веса экспертов первых N слоёв в CPU.",
+      "category": "gpu",
+      "kind": "int",
+      "default": 0,
+      "min": 0,
+      "max": 1000
+    },
+    {
+      "id": "mlock",
+      "flag": "--mlock",
+      "name": "Закрепить в RAM (mlock)",
+      "description": "Запретить выгрузку модели в swap. Медленный старт, стабильная работа.",
+      "category": "kv",
+      "kind": "bool"
+    },
+    {
+      "id": "no-mmap",
+      "flag": "--no-mmap",
+      "name": "Без mmap",
+      "description": "Не memory-map модель: загрузка медленнее, но меньше выгрузок страниц при нехватке памяти.",
+      "category": "kv",
+      "kind": "bool"
+    },
+    {
+      "id": "no-kv-offload",
+      "flag": "--no-kv-offload",
+      "short": "-nkvo",
+      "name": "KV-кэш без выгрузки",
+      "description": "Не выгружать KV-кэш в VRAM (держать в RAM).",
+      "category": "kv",
+      "kind": "bool"
+    },
+    {
+      "id": "cache-type-k",
+      "flag": "--cache-type-k",
+      "short": "-ctk",
+      "name": "Тип KV-кэша K",
+      "description": "Тип данных K-кэша. Квантованные типы (q4_0, q8_0) экономят память. Требует Flash Attention для V-квантования.",
+      "category": "kv",
+      "kind": "enum",
+      "options": ["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"],
+      "default": "f16"
+    },
+    {
+      "id": "cache-type-v",
+      "flag": "--cache-type-v",
+      "short": "-ctv",
+      "name": "Тип KV-кэша V",
+      "description": "Тип данных V-кэша. Квантование V требует Flash Attention (on).",
+      "category": "kv",
+      "kind": "enum",
+      "options": ["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"],
+      "default": "f16"
+    },
+    {
+      "id": "spec-type",
+      "flag": "--spec-type",
+      "name": "Тип спекулятивного декодинга",
+      "description": "Метод ускорения генерации. draft-mtp — для MTP-моделей (Gemma), draft-eagle3 — EAGLE, ngram-* — без второй модели, none — выключено.",
+      "category": "spec",
+      "kind": "enum",
+      "options": ["none", "draft-simple", "draft-eagle3", "draft-mtp", "draft-dflash", "draft-dspark", "ngram-simple", "ngram-map-k", "ngram-map-k4v", "ngram-mod", "ngram-cache"],
+      "default": "draft-mtp"
+    },
+    {
+      "id": "model-draft",
+      "flag": "--model-draft",
+      "short": "-md",
+      "name": "Draft-модель",
+      "description": "Файл draft-модели для спекулятивного декодинга (например, mtp-gemma-...-it.gguf).",
+      "category": "spec",
+      "kind": "path"
+    },
+    {
+      "id": "mmproj",
+      "flag": "--mmproj",
+      "short": "-mm",
+      "name": "Мультимодальный проектор",
+      "description": "Файл mmproj для поддержки изображений (например, mmproj-F16_e4b.gguf).",
+      "category": "spec",
+      "kind": "path"
+    },
+    {
+      "id": "spec-draft-n-max",
+      "flag": "--spec-draft-n-max",
+      "name": "Draft: макс. токенов",
+      "description": "Сколько токенов максимум черновика за шаг. Для MTP обычно 1.",
+      "category": "spec",
+      "kind": "int",
+      "default": 1,
+      "min": 0,
+      "max": 64
+    },
+    {
+      "id": "spec-draft-n-min",
+      "flag": "--spec-draft-n-min",
+      "name": "Draft: мин. токенов",
+      "description": "Минимум черновых токенов за шаг.",
+      "category": "spec",
+      "kind": "int",
+      "default": 0,
+      "min": 0,
+      "max": 64
+    },
+    {
+      "id": "ngld",
+      "flag": "--gpu-layers-draft",
+      "short": "-ngld",
+      "name": "Draft: слоёв в VRAM",
+      "description": "Сколько слоёв draft-модели держать в видеопамяти.",
+      "category": "spec",
+      "kind": "int",
+      "default": 99,
+      "min": 0,
+      "max": 1000
+    },
+    {
+      "id": "cache-type-k-draft",
+      "flag": "--cache-type-k-draft",
+      "short": "-ctkd",
+      "name": "Draft: тип KV K",
+      "description": "Тип данных K-кэша draft-модели.",
+      "category": "spec",
+      "kind": "enum",
+      "options": ["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"],
+      "default": "f16"
+    },
+    {
+      "id": "cache-type-v-draft",
+      "flag": "--cache-type-v-draft",
+      "short": "-ctvd",
+      "name": "Draft: тип KV V",
+      "description": "Тип данных V-кэша draft-модели.",
+      "category": "spec",
+      "kind": "enum",
+      "options": ["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"],
+      "default": "f16"
+    },
+    {
+      "id": "temp",
+      "flag": "--temp",
+      "name": "Температура",
+      "description": "Температура сэмплинга. Ниже — детерминированнее.",
+      "category": "sampling",
+      "kind": "float",
+      "default": 0.8,
+      "min": 0,
+      "max": 2
+    },
+    {
+      "id": "top-k",
+      "flag": "--top-k",
+      "name": "Top-K",
+      "description": "Отсекать токены за пределами K самых вероятных. 0 = выключено.",
+      "category": "sampling",
+      "kind": "int",
+      "default": 40,
+      "min": 0,
+      "max": 200
+    },
+    {
+      "id": "top-p",
+      "flag": "--top-p",
+      "name": "Top-P",
+      "description": "Nucleus sampling: отсечение по накопленной вероятности. 1.0 = выключено.",
+      "category": "sampling",
+      "kind": "float",
+      "default": 0.95,
+      "min": 0,
+      "max": 1
+    },
+    {
+      "id": "min-p",
+      "flag": "--min-p",
+      "name": "Min-P",
+      "description": "Отсечение токенов с вероятностью ниже доли от максимума. 0 = выключено.",
+      "category": "sampling",
+      "kind": "float",
+      "default": 0.05,
+      "min": 0,
+      "max": 1
+    },
+    {
+      "id": "repeat-penalty",
+      "flag": "--repeat-penalty",
+      "name": "Штраф за повторы",
+      "description": "Множитель штрафа за повтор токенов. 1.0 = выключено.",
+      "category": "sampling",
+      "kind": "float",
+      "default": 1.0,
+      "min": 0.5,
+      "max": 2
+    },
+    {
+      "id": "repeat-last-n",
+      "flag": "--repeat-last-n",
+      "name": "Повторы: окно",
+      "description": "Сколько последних токенов учитывать для штрафа. 0 = выключено.",
+      "category": "sampling",
+      "kind": "int",
+      "default": 64,
+      "min": 0,
+      "max": 4096
+    },
+    {
+      "id": "seed",
+      "flag": "--seed",
+      "short": "-s",
+      "name": "Seed",
+      "description": "Зерно генератора случайных чисел. -1 = случайный.",
+      "category": "sampling",
+      "kind": "int",
+      "default": -1,
+      "min": -1,
+      "max": 2147483647
+    },
+    {
+      "id": "no-webui",
+      "flag": "--no-webui",
+      "name": "Отключить Web UI",
+      "description": "Не поднимать встроенный веб-интерфейс llama-server (останутся только API).",
+      "category": "server",
+      "kind": "bool"
+    },
+    {
+      "id": "api-key",
+      "flag": "--api-key",
+      "name": "API-ключ",
+      "description": "Требовать этот ключ для доступа к API (полезно при host 0.0.0.0).",
+      "category": "server",
+      "kind": "string"
+    },
+    {
+      "id": "metrics",
+      "flag": "--metrics",
+      "name": "Метрики Prometheus",
+      "description": "Включить эндпоинт /metrics с метриками сервера.",
+      "category": "server",
+      "kind": "bool"
+    },
+    {
+      "id": "embeddings",
+      "flag": "--embeddings",
+      "name": "Режим эмбеддингов",
+      "description": "Только эмбеддинги (для dedicated embedding-моделей).",
+      "category": "server",
+      "kind": "bool"
+    },
+    {
+      "id": "timeout",
+      "flag": "--timeout",
+      "short": "-to",
+      "name": "Таймаут HTTP, сек",
+      "description": "Таймаут чтения/записи HTTP-соединения.",
+      "category": "server",
+      "kind": "int",
+      "default": 3600,
+      "min": 1,
+      "max": 86400
+    }
+  ]
+}

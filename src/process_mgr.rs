@@ -585,6 +585,7 @@ fn server_ready(host: &str, port: u16) -> bool {
 }
 
 /// True if the given address can be bound (i.e. it is free).
+#[allow(dead_code)] // used in unit tests
 pub fn port_free(host: &str, port: u16) -> bool {
     TcpListener::bind((host, port)).is_ok()
 }

@@ -1,6 +1,7 @@
 use egui::{Color32, CornerRadius, Style, Theme, ThemePreference, Visuals};
 
 pub const ACCENT: Color32 = Color32::from_rgb(0x3B, 0x82, 0xF6);
+#[allow(dead_code)] // reserved for hover states
 pub const ACCENT_HOVER: Color32 = Color32::from_rgb(0x60, 0x9B, 0xF8);
 pub const OK_GREEN: Color32 = Color32::from_rgb(0x16, 0xA3, 0x4A);
 pub const WARN_YELLOW: Color32 = Color32::from_rgb(0xD9, 0x94, 0x06);

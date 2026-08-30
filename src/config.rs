@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::params::ParamState;
 use crate::theme::ThemeMode;
 
 const APP_NAME: &str = "llamacpp-manager";
@@ -48,6 +49,8 @@ pub struct Settings {
     pub debug_logging: bool,
     pub auto_restore: AutoRestore,
     pub params_catalog_url: String,
+    /// Last used parameter values (persisted between runs; presets come later).
+    pub params: ParamState,
 }
 
 impl Default for Settings {
@@ -65,6 +68,7 @@ impl Default for Settings {
             debug_logging: false,
             auto_restore: AutoRestore::default(),
             params_catalog_url: DEFAULT_PARAMS_CATALOG_URL.to_string(),
+            params: ParamState::default(),
         }
     }
 }
