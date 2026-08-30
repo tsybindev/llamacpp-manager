@@ -1782,10 +1782,12 @@ dependencies = [
  "directories",
  "eframe",
  "egui",
+ "libc",
  "log",
  "rfd",
  "serde",
  "serde_json",
+ "shlex",
 ]
 
 [[package]]

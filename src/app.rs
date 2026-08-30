@@ -5,6 +5,7 @@ use egui::{Color32, RichText, ScrollArea};
 
 use crate::config::{self, Settings};
 use crate::logger::{self, LogHandle, LogEntry};
+use crate::process_mgr::{ServerConfig, ServerState, ServerManager};
 use crate::theme::{self, ThemeMode};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -54,6 +55,44 @@ pub struct App {
     log_handle: Option<LogHandle>,
     config_dirty: bool,
     last_change: Option<Instant>,
+    server: ServerManager,
+    server_form: ServerForm,
+}
+
+/// Editable server launch parameters (will become presets in a later stage).
+#[derive(Clone, Debug)]
+struct ServerForm {
+    binary: PathBuf,
+    model: PathBuf,
+    host: String,
+    port: u16,
+    extra_args: String,
+    last_error: Option<String>,
+}
+
+impl Default for ServerForm {
+    fn default() -> Self {
+        Self {
+            binary: PathBuf::new(),
+            model: PathBuf::new(),
+            host: "127.0.0.1".to_string(),
+            port: 8080,
+            extra_args: String::new(),
+            last_error: None,
+        }
+    }
+}
+
+impl ServerForm {
+    fn to_config(&self) -> ServerConfig {
+        ServerConfig {
+            binary: self.binary.clone(),
+            model: self.model.clone(),
+            host: self.host.trim().to_string(),
+            port: self.port,
+            extra_args: shlex::split(&self.extra_args).unwrap_or_default(),
+        }
+    }
 }
 
 impl Default for App {
@@ -87,6 +126,8 @@ impl App {
         Self {
             page: Page::Server,
             sidebar_collapsed: settings.sidebar_collapsed,
+            server: ServerManager::new(settings.logs_dir.clone(), settings.auto_restore.clone()),
+            server_form: ServerForm::default(),
             settings,
             applied_theme: None,
             log_handle,
@@ -196,9 +237,228 @@ impl App {
     }
 
     fn server_page(&mut self, ui: &mut egui::Ui) {
-        ui.label("Экран управления сервером будет здесь: запуск/остановка llama-server, логи, статус.");
+        self.server_status_bar(ui);
+        ui.add_space(8.0);
+        self.server_config_section(ui);
+        ui.add_space(12.0);
+        self.server_log_panel(ui);
         ui.add_space(12.0);
         self.app_log_panel(ui);
+    }
+
+    /// Pre-start checks shown to the user before spawning the process.
+    /// Returns Err with a human-readable summary when it is not OK to proceed.
+    fn pre_flight_check(&self, config: &ServerConfig) -> Result<(), String> {
+        let mut problems: Vec<String> = Vec::new();
+        if !config.binary.is_file() {
+            problems.push(format!("бинарник не найден: {}", config.binary.display()));
+        }
+        if !config.model.is_file() {
+            problems.push(format!("файл модели не найден: {}", config.model.display()));
+        }
+        if crate::process_mgr::port_in_use(&config.host, config.port) {
+            problems.push(format!("порт {} уже занят другим процессом", config.port));
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            let summary = problems.join("; ");
+            log::warn!("Предпусковая проверка не пройдена: {summary}");
+            Err(summary)
+        }
+    }
+
+    fn server_status_bar(&mut self, ui: &mut egui::Ui) {
+        let state = self.server.state();
+        let (color, hint) = match state {
+            ServerState::Stopped => (Color32::from_rgb(0x8A, 0x94, 0xA6), "Сервер не запущен"),
+            ServerState::Starting => (theme::WARN_YELLOW, "Идёт загрузка модели, проверяется готовность…"),
+            ServerState::Ready => (theme::OK_GREEN, "Сервер отвечает и готов принимать запросы"),
+            ServerState::RestartScheduled => (theme::WARN_YELLOW, "Процесс упал, ожидается автоматический перезапуск"),
+            ServerState::Crashed => (theme::ERR_RED, "Требуется вмешательство пользователя"),
+        };
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("●").color(color).size(18.0));
+            ui.label(RichText::new(state.label()).size(16.0).strong());
+            ui.label(RichText::new(hint).weak().small());
+        });
+        if state == ServerState::Ready {
+            ui.horizontal(|ui| {
+                let url = format!(
+                    "http://{}:{}",
+                    self.server_form.host.trim(),
+                    self.server_form.port
+                );
+                ui.label(RichText::new(&url).monospace());
+                if ui.small_button("Копировать адрес API").clicked() {
+                    ui.ctx().copy_text(url.clone());
+                }
+                if ui.small_button("Открыть в браузере").clicked() {
+                    open_url(&url);
+                }
+            });
+        }
+    }
+
+    fn server_config_section(&mut self, ui: &mut egui::Ui) {
+        ui.heading(RichText::new("Конфигурация").size(16.0));
+        let mut paths_changed = false;
+        egui::Grid::new("server_grid")
+            .num_columns(3)
+            .spacing([12.0, 8.0])
+            .show(ui, |ui| {
+                let form = &mut self.server_form;
+                paths_changed |= path_row(ui, "Бинарник llama-server", &mut form.binary, "путь к llama-server");
+                paths_changed |= path_row(ui, "Файл модели", &mut form.model, "путь к GGUF-файлу модели");
+                ui.label("Host").on_hover_text("127.0.0.1 — только локально; 0.0.0.0 — доступ из сети (опасно!)");
+                let host_response = ui.add(
+                    egui::TextEdit::singleline(&mut form.host).desired_width(160.0),
+                );
+                if host_response.changed() {
+                    // normalise on leave only; keep raw while typing
+                }
+                ui.label("");
+                ui.end_row();
+                ui.label("Порт");
+                ui.add(
+                    egui::DragValue::new(&mut form.port)
+                        .range(1..=65535)
+                        .custom_formatter(|v, _| format!("{}", v as u16))
+                        .custom_parser(|s| s.parse::<u16>().ok().map(f64::from)),
+                );
+                ui.label("");
+                ui.end_row();
+            });
+        if paths_changed {
+            // Paths live in the form, not settings — nothing to persist yet.
+        }
+
+        if self.server_form.host.trim() == "0.0.0.0" {
+            ui.label(
+                RichText::new("⚠ Host 0.0.0.0 делает сервер доступным из сети. Убедитесь, что это безопасно.")
+                    .small()
+                    .color(theme::WARN_YELLOW),
+            );
+        }
+
+        ui.add_space(4.0);
+        ui.label("Дополнительные аргументы").on_hover_text("Разделяйте пробелом; кавычки поддерживаются. Каталог параметров с описаниями появится позже.");
+        let response = ui.add(
+            egui::TextEdit::multiline(&mut self.server_form.extra_args)
+                .desired_rows(2)
+                .desired_width(560.0)
+                .code_editor(),
+        );
+        let _ = response;
+
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(format!(
+                "Команда запуска:\n{}",
+                self.server_form.to_config().command_line()
+            ))
+            .monospace()
+            .small(),
+        );
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let running = self.server.is_running();
+            if ui.add_enabled(!running, egui::Button::new(RichText::new("▶ Запустить").color(theme::OK_GREEN)))
+                .clicked()
+            {
+                self.server_form.last_error = None;
+                let config = self.server_form.to_config();
+                if let Err(e) = self.pre_flight_check(&config).and_then(|()| self.server.start(config)) {
+                    self.server_form.last_error = Some(e);
+                }
+            }
+            if ui
+                .add_enabled(running, egui::Button::new("■ Остановить"))
+                .clicked()
+            {
+                self.server.stop();
+            }
+            if ui
+                .add_enabled(self.server.config().is_some(), egui::Button::new("↻ Перезапустить"))
+                .clicked()
+            {
+                self.server_form.last_error = None;
+                if let Err(e) = self.server.restart() {
+                    self.server_form.last_error = Some(e);
+                }
+            }
+            if let Some(error) = &self.server_form.last_error {
+                ui.label(RichText::new(error).color(theme::ERR_RED).small());
+            }
+        });
+    }
+
+    fn server_log_panel(&mut self, ui: &mut egui::Ui) {
+        ui.collapsing(RichText::new("📜 Журнал llama-server").size(15.0), |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Сохранить лог в файл…").clicked() {
+                    self.save_server_log();
+                }
+                if ui.button("Очистить").clicked()
+                    && let Ok(mut log) = self.server.server_log().lock()
+                {
+                    log.clear();
+                }
+            });
+            ui.add_space(4.0);
+            let lines: Vec<(chrono::DateTime<chrono::Local>, String)> = self
+                .server
+                .server_log()
+                .lock()
+                .map(|log| log.lines().to_vec())
+                .unwrap_or_default();
+            ScrollArea::vertical()
+                .id_salt("server_log")
+                .stick_to_bottom(true)
+                .max_height(320.0)
+                .show(ui, |ui| {
+                    egui::Frame::default()
+                        .fill(ui.visuals().extreme_bg_color)
+                        .inner_margin(6.0)
+                        .corner_radius(6.0)
+                        .show(ui, |ui| {
+                            if lines.is_empty() {
+                                ui.weak("нет вывода процесса");
+                            }
+                            for (time, line) in lines {
+                                ui.label(
+                                    RichText::new(format!("{} {}", time.format("%H:%M:%S"), line))
+                                        .monospace()
+                                        .size(12.0),
+                                );
+                            }
+                        });
+                });
+        });
+    }
+
+    fn save_server_log(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name("llama-server.log")
+            .save_file()
+        else {
+            return;
+        };
+        let lines = self
+            .server
+            .server_log()
+            .lock()
+            .map(|log| log.lines().to_vec())
+            .unwrap_or_default();
+        let content = lines
+            .iter()
+            .map(|(time, line)| format!("{} {}\n", time.format("%Y-%m-%d %H:%M:%S%.3f"), line))
+            .collect::<String>();
+        match std::fs::write(&path, content) {
+            Ok(()) => log::info!("Лог сервера сохранён: {}", path.display()),
+            Err(e) => log::error!("Не удалось сохранить лог: {e}"),
+        }
     }
 
     fn app_log_panel(&mut self, ui: &mut egui::Ui) {
@@ -393,6 +653,7 @@ impl App {
             );
         });
         if ar != self.settings.auto_restore {
+            self.server.set_auto_restore(ar.clone());
             self.settings.auto_restore = ar;
             self.mark_dirty();
         }
@@ -445,6 +706,17 @@ fn open_folder(path: &std::path::Path) {
     }
 }
 
+fn open_url(url: &str) {
+    let result = if cfg!(target_os = "windows") {
+        std::process::Command::new("cmd").args(["/C", "start", url]).spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(url).spawn()
+    };
+    if let Err(e) = result {
+        log::warn!("Не удалось открыть {url}: {e}");
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if self.applied_theme != Some(self.settings.theme) {
@@ -473,6 +745,11 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
+        // PRD: llama-server must not outlive the manager.
+        if self.server.is_running() {
+            log::info!("Выход из приложения: останавливаем llama-server");
+            self.server.stop();
+        }
         if self.config_dirty {
             self.save_settings();
         }

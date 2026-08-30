@@ -13,3 +13,7 @@ log = "0.4.34"
 rfd = "0.17.2"
 serde = "1.0.229"
 serde_json = "1.0.151"
+shlex = "2.0.1"
+
+[target."cfg(unix)".dependencies]
+libc = "0.2.189"
