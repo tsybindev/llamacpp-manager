@@ -1118,7 +1118,9 @@ impl App {
         let assets = self.current_os_assets();
         if assets.is_empty() && !self.build_releases_loading && self.build_releases_error.is_none()
         {
-            ui.label("Нет доступных релизов для вашей платформы.");
+            ui.label(RichText::new(
+                "Для вашей платформы сборки не определились автоматически — выберите файл вручную в списке ниже.",
+            ).color(theme::WARN_YELLOW));
         }
         ScrollArea::vertical().show(ui, |ui| {
             let mut last_tag = String::new();
@@ -1156,19 +1158,78 @@ impl App {
                     }
                 });
             }
+
+            let manual = self.manual_assets(&assets);
+            if !manual.is_empty() {
+                ui.add_space(8.0);
+                egui::CollapsingHeader::new(RichText::new(
+                    "Другие файлы релизов (выбор вручную)",
+                ))
+                .default_open(assets.is_empty())
+                .show(ui, |ui| {
+                    for (tag, asset) in manual {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&asset.name).small());
+                            ui.label(RichText::new(format_size(asset.size)).small().weak());
+                            if ui
+                                .add_enabled(
+                                    self.build_download.is_none(),
+                                    egui::Button::new("Скачать"),
+                                )
+                                .on_hover_text(format!("Релиз {tag}\n{}", asset.browser_download_url))
+                                .clicked()
+                            {
+                                let kind = github::classify_asset(&asset.name);
+                                self.start_build_download(github::BuildAsset {
+                                    asset: asset.clone(),
+                                    tag,
+                                    os: kind.and_then(|k| k.os),
+                                    arch: kind.and_then(|k| k.arch),
+                                    backend: kind
+                                        .map(|k| k.backend)
+                                        .unwrap_or(github::Backend::Other),
+                                    runtime_asset: None,
+                                });
+                            }
+                        });
+                    }
+                });
+            }
         });
     }
 
-    /// Ассеты релизов для текущей ОС (плоский список в порядке релизов).
+    /// Ассеты релизов для текущей ОС и архитектуры (в порядке релизов).
     fn current_os_assets(&self) -> Vec<github::BuildAsset> {
-        let current_os = github::TargetOs::current();
+        let (current_os, current_arch) = (github::TargetOs::current(), github::Arch::current());
         self.build_releases
             .as_deref()
             .map(github::buildable_assets)
             .unwrap_or_default()
             .into_iter()
-            .filter(|asset| Some(asset.os) == current_os)
+            .filter(|asset| asset.os == current_os && asset.arch == current_arch)
             .collect()
+    }
+
+    /// Прочие файлы релизов (другие ОС/архитектуры) для ручного выбора,
+    /// когда автоматическая классификация ничего не подобрала или нужен
+    /// нестандартный вариант.
+    fn manual_assets(&self, primary: &[github::BuildAsset]) -> Vec<(String, github::Asset)> {
+        let mut out = Vec::new();
+        for release in self.build_releases.as_deref().unwrap_or(&[]) {
+            for asset in &release.assets {
+                if primary.iter().any(|build| build.asset.name == asset.name) {
+                    continue;
+                }
+                let lower = asset.name.to_ascii_lowercase();
+                let is_server_archive = lower.starts_with("llama-")
+                    && lower.contains("-bin-")
+                    && (lower.ends_with(".zip") || lower.ends_with(".tar.gz"));
+                if is_server_archive {
+                    out.push((release.tag.clone(), asset.clone()));
+                }
+            }
+        }
+        out
     }
 
     /// Панель прогресса и результата текущего скачивания сборки.

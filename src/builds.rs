@@ -42,31 +42,40 @@ impl InstalledBuild {
     }
 }
 
-/// Найти llama-server[.exe] в каталоге сборки.
+/// Найти llama-server[.exe] в каталоге сборки (включая подкаталоги до 3 уровней —
+/// глубина вложенности внутри архивов релизов различается между форматами).
 pub fn server_binary_in(dir: &Path) -> Option<PathBuf> {
     let exe = if cfg!(target_os = "windows") {
         "llama-server.exe"
     } else {
         "llama-server"
     };
-    let direct = dir.join(exe);
-    if direct.is_file() {
-        return Some(direct);
-    }
-    // В zip-архивах релизов бинарник лежит в корне, но подстрахуемся
-    // одн уровнем вложенности (папка внутри архива).
-    let entries = fs::read_dir(dir).ok()?;
-    for entry in entries.flatten() {
-        let nested = entry.path().join(exe);
-        if nested.is_file() {
-            return Some(nested);
+    fn search(dir: &Path, exe: &str, depth: u8) -> Option<PathBuf> {
+        if depth > 3 {
+            return None;
         }
+        let direct = dir.join(exe);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        let entries = fs::read_dir(dir).ok()?;
+        let mut nested_dirs = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() && path.file_name().and_then(|n| n.to_str()) == Some(exe) {
+                return Some(path);
+            }
+            if path.is_dir() {
+                nested_dirs.push(path);
+            }
+        }
+        nested_dirs.iter().find_map(|sub| search(sub, exe, depth + 1))
     }
-    None
+    search(dir, exe, 0)
 }
 
-/// Разобрать имя каталога сборки: `llama-b10635-win-cuda-12.4-x64`
-/// → ("b10635", Cuda). Возвращает None для чужих каталогов.
+/// Разобрать имя каталога сборки: `llama-b10688-ubuntu-vulkan-x64`
+/// → ("b10688", Vulkan). Возвращает None для чужих каталогов.
 pub fn parse_dir_name(name: &str) -> Option<(String, Backend)> {
     let rest = name.strip_prefix("llama-")?;
     let dash = rest.find('-')?;
@@ -78,6 +87,14 @@ pub fn parse_dir_name(name: &str) -> Option<(String, Backend)> {
         Backend::Vulkan
     } else if rest.contains("cuda") {
         Backend::Cuda
+    } else if rest.contains("rocm") {
+        Backend::Rocm
+    } else if rest.contains("sycl") {
+        Backend::Sycl
+    } else if rest.contains("openvino") {
+        Backend::Openvino
+    } else if rest.contains("opencl") {
+        Backend::Opencl
     } else {
         Backend::Cpu
     };
@@ -127,7 +144,8 @@ impl BuildsStore {
 
     /// Скачивание и установка сборки. Блокирующая — вызывать из фонового
     /// потока; прогресс отдаётся через колбэк. Повторная установка
-    /// существующей сборки заменяет её содержимое.
+    /// существующей сборки заменяет её содержимое. Для Windows CUDA
+    /// вместе со сборкой ставится парный cudart-архив, если он есть.
     pub fn install(
         &self,
         asset: &BuildAsset,
@@ -136,17 +154,31 @@ impl BuildsStore {
         fs::create_dir_all(&self.dir)
             .with_context(|| format!("не удалось создать каталог {}", self.dir.display()))?;
 
-        let zip_path = self
-            .dir
-            .join(format!(".download-{}-{}.zip", asset.dir_name(), std::process::id()));
-        download_file(&asset.asset.browser_download_url, &zip_path, |d, t| {
-            progress(Progress::Downloading { downloaded: d, total: t })
-        })
+        let main_path = self.dir.join(format!(".download-{}", asset.asset.name));
+        download_file(
+            &asset.asset.browser_download_url,
+            &main_path,
+            |d, t| progress(Progress::Downloading { downloaded: d, total: t }),
+        )
         .with_context(|| format!("скачивание {}", asset.asset.name))?;
 
+        // cudart-рантайм нужен Windows CUDA сборкам (отдельный архив в релизе).
+        let runtime_path = match &asset.runtime_asset {
+            Some(runtime) => {
+                let path = self.dir.join(format!(".download-{}", runtime.name));
+                download_file(&runtime.browser_download_url, &path, |_, _| {})
+                    .with_context(|| format!("скачивание {}", runtime.name))?;
+                Some(path)
+            }
+            None => None,
+        };
+
         progress(Progress::Extracting);
-        let result = install_zip(&zip_path, self, asset);
-        let _ = fs::remove_file(&zip_path);
+        let result = install_archive(&main_path, runtime_path.as_deref(), self, asset);
+        let _ = fs::remove_file(&main_path);
+        if let Some(path) = runtime_path {
+            let _ = fs::remove_file(path);
+        }
         result
     }
 }
@@ -170,58 +202,45 @@ pub fn download_file(
     .with_context(|| format!("скачивание {url}"))
 }
 
-/// Распаковать скачанный zip релиза в каталог сборки библиотеки.
-/// Устанавливает через staging-каталог: распаковка → замена целевого каталога.
-fn install_zip(zip_path: &Path, store: &BuildsStore, asset: &BuildAsset) -> Result<InstalledBuild> {
-    let file = File::open(zip_path)
-        .with_context(|| format!("не удалось открыть {}", zip_path.display()))?;
-    let mut archive = ZipArchive::new(file).context("чтение zip-архива")?;
-
-    let final_dir = store.dir_for(asset);
+/// Распаковать скачанный архив релиза (zip или tar.gz) в каталог сборки
+/// библиотеки. Устанавливает через staging-каталог: распаковка → замена
+/// целевого каталога. `runtime_archive` (cudart для CUDA) распаковывается туда же.
+fn install_archive(
+    archive_path: &Path,
+    runtime_archive: Option<&Path>,
+    store: &BuildsStore,
+    asset: &BuildAsset,
+) -> Result<InstalledBuild> {
     let staging = store.dir.join(format!(".staging-{}", asset.dir_name()));
     let _ = fs::remove_dir_all(&staging);
     fs::create_dir_all(&staging)
         .with_context(|| format!("не удалось создать каталог {}", staging.display()))?;
 
-    for index in 0..archive.len() {
-        let mut entry = archive.by_index(index).context("чтение записи zip")?;
-        // enclosed_name отсекает zip-slip: пути, выходящие за каталог распаковки.
-        let Some(relative) = entry.enclosed_name() else {
-            continue;
-        };
-        let target = staging.join(&relative);
-        if entry.is_dir() {
-            fs::create_dir_all(&target).with_context(|| {
-                format!("не удалось создать каталог {}", target.display())
-            })?;
-        } else {
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent).with_context(|| {
-                    format!("не удалось создать каталог {}", parent.display())
-                })?;
+    let result = extract_archive(archive_path, &staging)
+        .and_then(|()| match runtime_archive {
+            Some(runtime) => extract_archive(runtime, &staging),
+            None => Ok(()),
+        })
+        .and_then(|()| {
+            if server_binary_in(&staging).is_none() {
+                bail!("в архиве {} не найден llama-server", asset.asset.name);
             }
-            let mut out = File::create(&target)
-                .with_context(|| format!("не удалось создать файл {}", target.display()))?;
-            std::io::copy(&mut entry, &mut out)
-                .with_context(|| format!("распаковка {}", relative.display()))?;
-        }
-    }
-
-    if server_binary_in(&staging).is_none() {
+            Ok(())
+        })
+        .and_then(|()| {
+            let final_dir = store.dir_for(asset);
+            // Заменяем старую установку той же версии.
+            let _ = fs::remove_dir_all(&final_dir);
+            fs::rename(&staging, &final_dir).with_context(|| {
+                format!("переименование {} → {}", staging.display(), final_dir.display())
+            })
+        });
+    if result.is_err() {
         let _ = fs::remove_dir_all(&staging);
-        bail!("в архиве {} не найден llama-server", asset.asset.name);
     }
 
-    // Заменяем старую установку той же версии.
-    let _ = fs::remove_dir_all(&final_dir);
-    fs::rename(&staging, &final_dir).with_context(|| {
-        format!(
-            "переименование {} → {}",
-            staging.display(),
-            final_dir.display()
-        )
-    })?;
-
+    let final_dir = store.dir_for(asset);
+    result?;
     let (tag, _) = parse_dir_name(&asset.dir_name())
         .with_context(|| format!("неожиданное имя каталога {}", asset.dir_name()))?;
     Ok(InstalledBuild {
@@ -229,6 +248,58 @@ fn install_zip(zip_path: &Path, store: &BuildsStore, asset: &BuildAsset) -> Resu
         tag,
         backend: asset.backend,
     })
+}
+
+/// Распаковать zip или tar.gz в каталог (в зависимости от расширения файла).
+fn extract_archive(archive_path: &Path, staging: &Path) -> Result<()> {
+    let name = archive_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if name.ends_with(".tar.gz") {
+        extract_targz(archive_path, staging)
+    } else {
+        extract_zip(archive_path, staging)
+    }
+}
+
+fn extract_zip(archive_path: &Path, staging: &Path) -> Result<()> {
+    let file = File::open(archive_path)
+        .with_context(|| format!("не удалось открыть {}", archive_path.display()))?;
+    let mut archive = ZipArchive::new(file).context("чтение zip-архива")?;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).context("чтение записи zip")?;
+        // enclosed_name отсекает zip-slip: пути, выходящие за каталог распаковки.
+        let Some(relative) = entry.enclosed_name() else {
+            continue;
+        };
+        unpack_entry(|out| std::io::copy(&mut entry, out), staging.join(relative))?;
+    }
+    Ok(())
+}
+
+fn extract_targz(archive_path: &Path, staging: &Path) -> Result<()> {
+    let file = File::open(archive_path)
+        .with_context(|| format!("не удалось открыть {}", archive_path.display()))?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    // unpack сам проверяет пути на выход за каталог и сохраняет права
+    // (исполнимый бит llama-server на Linux критичен для запуска).
+    archive.unpack(staging).context("распаковка tar.gz")?;
+    Ok(())
+}
+
+/// Записать файл архива по целевому пути, создав промежуточные каталоги.
+fn unpack_entry(mut copy: impl FnMut(&mut File) -> std::io::Result<u64>, target: PathBuf) -> Result<()> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("не удалось создать каталог {}", parent.display()))?;
+    }
+    let mut out = File::create(&target)
+        .with_context(|| format!("не удалось создать файл {}", target.display()))?;
+    copy(&mut out).with_context(|| format!("распаковка {}", target.display()))?;
+    Ok(())
 }
 
 // --- Кэш списка релизов ---
@@ -303,7 +374,6 @@ fn read_cache(path: &Path) -> Result<ReleasesCache> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::github::TargetOs;
     use std::io::Write as _;
 
     fn temp_root(label: &str) -> PathBuf {
@@ -317,15 +387,18 @@ mod tests {
     }
 
     fn sample_asset(name: &str, url: &str) -> BuildAsset {
+        let kind = crate::github::classify_asset(name).expect("имя должно классифицироваться");
         BuildAsset {
             asset: github::Asset {
                 name: name.to_string(),
                 browser_download_url: url.to_string(),
                 size: 0,
             },
-            tag: "b10635".into(),
-            os: TargetOs::Linux,
-            backend: Backend::Cpu,
+            tag: "b10688".into(),
+            os: kind.os,
+            arch: kind.arch,
+            backend: kind.backend,
+            runtime_asset: None,
         }
     }
 
@@ -342,19 +415,45 @@ mod tests {
         zip.finish().unwrap();
     }
 
+    /// Собрать тестовый tar.gz с бинарником во вложенном каталоге
+    /// (как в реальных релизах llama.cpp) с правом на исполнение.
+    fn make_test_targz(path: &Path) {
+        let file = File::create(path).unwrap();
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        let mut tar = tar::Builder::new(encoder);
+        let bin = b"#!/bin/sh\necho mock llama-server\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bin.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        tar.append_data(&mut header, "llama-b10688-bin-ubuntu-x64/llama-server", &bin[..])
+            .unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(11);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "llama-b10688-bin-ubuntu-x64/sub/libex.so", &b"binary-blob"[..])
+            .unwrap();
+        tar.into_inner().unwrap().finish().unwrap();
+    }
+
     #[test]
     fn parse_dir_name_variants() {
         assert_eq!(
-            parse_dir_name("llama-b10635-ubuntu-x64"),
-            Some(("b10635".into(), Backend::Cpu))
+            parse_dir_name("llama-b10688-ubuntu-x64"),
+            Some(("b10688".into(), Backend::Cpu))
         );
         assert_eq!(
-            parse_dir_name("llama-b10635-win-cuda-12.4-x64"),
-            Some(("b10635".into(), Backend::Cuda))
+            parse_dir_name("llama-b10688-win-cuda-12.4-x64"),
+            Some(("b10688".into(), Backend::Cuda))
         );
         assert_eq!(
-            parse_dir_name("llama-b10635-win-vulkan-x64"),
-            Some(("b10635".into(), Backend::Vulkan))
+            parse_dir_name("llama-b10688-ubuntu-vulkan-x64"),
+            Some(("b10688".into(), Backend::Vulkan))
+        );
+        assert_eq!(
+            parse_dir_name("llama-b10688-ubuntu-rocm-7.14-x64"),
+            Some(("b10688".into(), Backend::Rocm))
         );
         // Чужие каталоги и пустые теги не распознаются.
         assert_eq!(parse_dir_name("releases-cache.json"), None);
@@ -365,11 +464,11 @@ mod tests {
     fn install_zip_extracts_and_replaces() {
         let root = temp_root("install");
         let store = BuildsStore::new(root.clone());
-        let asset = sample_asset("llama-b10635-bin-ubuntu-x64.zip", "https://unused");
+        let asset = sample_asset("llama-b10688-bin-ubuntu-x64.zip", "https://unused");
         make_test_zip(&root.join("test.zip"));
 
-        let build = install_zip(&root.join("test.zip"), &store, &asset).expect("установка");
-        assert_eq!(build.tag, "b10635");
+        let build = install_archive(&root.join("test.zip"), None, &store, &asset).expect("установка");
+        assert_eq!(build.tag, "b10688");
         assert_eq!(build.backend, Backend::Cpu);
         assert_eq!(build.dir, store.dir_for(&asset));
         assert_eq!(
@@ -381,8 +480,53 @@ mod tests {
 
         // Повторная установка (обновление версии) заменяет каталог целиком.
         make_test_zip(&root.join("test.zip"));
-        install_zip(&root.join("test.zip"), &store, &asset).expect("повторная установка");
+        install_archive(&root.join("test.zip"), None, &store, &asset).expect("повторная установка");
         assert!(build.server_binary().is_some());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn install_targz_extracts_with_nested_dir_and_permissions() {
+        let root = temp_root("install-targz");
+        let store = BuildsStore::new(root.clone());
+        let asset = sample_asset("llama-b10688-bin-ubuntu-vulkan-x64.tar.gz", "https://unused");
+        assert_eq!(asset.backend, Backend::Vulkan);
+        make_test_targz(&root.join("test.tar.gz"));
+
+        let build = install_archive(&root.join("test.tar.gz"), None, &store, &asset)
+            .expect("установка tar.gz");
+        let bin = build.server_binary().expect("llama-server найден во вложенном каталоге");
+        assert_eq!(fs::read(&bin).unwrap(), b"#!/bin/sh\necho mock llama-server\n");
+        // Исполнимый бит сохранён (иначе llama-server не запустится).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&bin).unwrap().permissions().mode();
+            assert_ne!(mode & 0o111, 0, "нет прав на исполнение у llama-server");
+        }
+        assert!(build.dir.join("llama-b10688-bin-ubuntu-x64/sub/libex.so").is_file());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn install_targz_with_runtime_archive_merges_into_one_dir() {
+        let root = temp_root("install-runtime");
+        let store = BuildsStore::new(root.clone());
+        let asset = sample_asset("llama-b10688-bin-ubuntu-vulkan-x64.tar.gz", "https://unused");
+        make_test_targz(&root.join("test.tar.gz"));
+        make_test_zip(&root.join("runtime.zip"));
+
+        let build = install_archive(
+            &root.join("test.tar.gz"),
+            Some(&root.join("runtime.zip")),
+            &store,
+            &asset,
+        )
+        .expect("установка с рантаймом");
+        assert!(build.server_binary().is_some());
+        assert!(build.dir.join("sub/libexample.so").is_file());
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -401,7 +545,7 @@ mod tests {
         zip.write_all(b"no binaries here").unwrap();
         zip.finish().unwrap();
 
-        let err = install_zip(&root.join("empty.zip"), &store, &asset);
+        let err = install_archive(&root.join("empty.zip"), None, &store, &asset);
         assert!(err.is_err());
         // staging-каталог и целевой каталог не должны остаться.
         assert!(!store.dir_for(&asset).exists());
