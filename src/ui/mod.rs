@@ -423,7 +423,13 @@ pub fn param_row(
         _ => {
             ui.horizontal(|ui| {
                 let mut enabled = state.is_enabled(&def.id);
-                ui.checkbox(&mut enabled, "").on_hover_text(&tooltip);
+                if ui
+                    .checkbox(&mut enabled, "")
+                    .on_hover_text(&tooltip)
+                    .changed()
+                {
+                    state.set(&def.id, enabled);
+                }
                 ui.add_sized([LABEL_WIDTH, 18.0], egui::Label::new(RichText::new(&def.name).size(13.0)))
                     .on_hover_text(&tooltip);
 
