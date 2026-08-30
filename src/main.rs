@@ -1,7 +1,9 @@
 mod app;
 mod builds;
 mod config;
+mod download;
 mod github;
+mod huggingface;
 mod logger;
 mod params;
 mod presets;

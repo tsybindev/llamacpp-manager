@@ -2,9 +2,8 @@
 //! распаковка zip и кэш списка версий.
 
 use std::fs::{self, File};
-use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -153,51 +152,22 @@ impl BuildsStore {
 }
 
 /// Скачать файл по URL с отчётом о прогрессе (блокирующе).
+/// Общая реализация — в `download.rs`; здесь без докачки и без заголовков.
 pub fn download_file(
     url: &str,
     dest: &Path,
-    mut progress: impl FnMut(u64, u64),
+    progress: impl FnMut(u64, u64),
 ) -> Result<()> {
-    // Без timeout_global: он накрыл бы и чтение тела, а сборки — сотни мегабайт.
-    let mut response = ureq::get(url)
-        .header("User-Agent", USER_AGENT)
-        .config()
-        .timeout_connect(Some(Duration::from_secs(30)))
-        .build()
-        .call()
-        .context("HTTP-запрос")?;
-
-    let total = response
-        .headers()
-        .get("Content-Length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
-
-    let mut reader = response.body_mut().as_reader();
-    let mut file = File::create(dest).with_context(|| {
-        format!("не удалось создать файл {}", dest.display())
-    })?;
-
-    let mut downloaded: u64 = 0;
-    let mut last_reported: u64 = 0;
-    let mut chunk = [0u8; 64 * 1024];
-    loop {
-        let read = reader.read(&mut chunk).context("чтение тела ответа")?;
-        if read == 0 {
-            break;
-        }
-        file.write_all(&chunk[..read]).context("запись файла")?;
-        downloaded += read as u64;
-        // Отчитываемся не чаще раза в мегабайт, чтобы не перегружать канал UI.
-        if downloaded - last_reported >= 1024 * 1024 {
-            last_reported = downloaded;
-            progress(downloaded, total);
-        }
-    }
-    file.flush().context("запись файла")?;
-    progress(downloaded, if total > 0 { total } else { downloaded });
-    Ok(())
+    crate::download::download_file(
+        &crate::download::DownloadRequest {
+            url: url.to_string(),
+            dest: dest.to_path_buf(),
+            headers: vec![("User-Agent".to_string(), USER_AGENT.to_string())],
+            resume: false,
+        },
+        progress,
+    )
+    .with_context(|| format!("скачивание {url}"))
 }
 
 /// Распаковать скачанный zip релиза в каталог сборки библиотеки.
