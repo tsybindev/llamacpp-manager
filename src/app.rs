@@ -82,6 +82,10 @@ pub struct App {
     build_releases_rx: Option<mpsc::Receiver<Result<Vec<github::Release>, String>>>,
     build_releases_loading: bool,
     build_releases_error: Option<String>,
+    /// Фильтр списка релизов: тег версии (b10690) или бэкенд (vulkan).
+    build_filter: String,
+    /// Показывать все релизы (по умолчанию — только 5 последних).
+    build_show_all: bool,
     /// Текущее скачивание/установка сборки, если идёт.
     build_download: Option<BuildDownload>,
     /// Fresh catalog fetched in the background, picked up on the next frame.
@@ -225,6 +229,8 @@ impl App {
             build_releases_rx: None,
             build_releases_loading: false,
             build_releases_error: None,
+            build_filter: String::new(),
+            build_show_all: false,
             build_download: None,
             catalog_refresh,
             settings,
@@ -1111,10 +1117,35 @@ impl App {
                 ui.label(RichText::new(error).small().color(theme::ERR_RED));
             }
         });
+        ui.horizontal(|ui| {
+            ui.label("Фильтр:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.build_filter)
+                    .desired_width(220.0)
+                    .hint_text("версия или бэкенд: b10690, vulkan…"),
+            );
+            if !self.build_filter.is_empty() && ui.small_button("×").clicked() {
+                self.build_filter.clear();
+            }
+            let toggle_label = if self.build_show_all {
+                "Показать 5 последних"
+            } else {
+                "Показать все релизы"
+            };
+            if ui.button(toggle_label).clicked() {
+                self.build_show_all = !self.build_show_all;
+            }
+            if !self.build_show_all {
+                let hidden = self.total_filtered_tags().saturating_sub(self.visible_release_count());
+                if hidden > 0 {
+                    ui.label(RichText::new(format!("ещё {hidden} релизов скрыто")).weak());
+                }
+            }
+        });
         ui.add_space(4.0);
         self.build_download_panel(ui);
 
-        let assets = self.current_os_assets();
+        let assets = self.visible_os_assets();
         if assets.is_empty() && !self.build_releases_loading && self.build_releases_error.is_none()
         {
             ui.label(RichText::new(
@@ -1164,7 +1195,16 @@ impl App {
                 });
             }
 
-            let manual = self.manual_assets(&assets);
+            let manual: Vec<_> = self
+                .manual_assets(&assets)
+                .into_iter()
+                .filter(|(tag, asset)| {
+                    let backend = github::classify_asset(&asset.name)
+                        .map(|kind| kind.backend)
+                        .unwrap_or(github::Backend::Other);
+                    self.asset_matches_filter(tag, &asset.name, backend)
+                })
+                .collect();
             if !manual.is_empty() {
                 ui.add_space(8.0);
                 egui::CollapsingHeader::new(RichText::new(
@@ -1213,6 +1253,45 @@ impl App {
             .into_iter()
             .filter(|asset| asset.os == current_os && asset.arch == current_arch)
             .collect()
+    }
+
+    /// Соответствует ли сборка фильтру (тег, имя файла или бэкенд).
+    fn asset_matches_filter(&self, tag: &str, asset_name: &str, backend: github::Backend) -> bool {
+        let filter = self.build_filter.trim().to_lowercase();
+        if filter.is_empty() {
+            return true;
+        }
+        tag.to_lowercase().contains(&filter)
+            || asset_name.to_lowercase().contains(&filter)
+            || backend.label().to_lowercase().contains(&filter)
+    }
+
+    /// Ассеты текущей платформы с учётом фильтра и лимита релизов
+    /// (по умолчанию — только 5 последних версий).
+    fn visible_os_assets(&self) -> Vec<github::BuildAsset> {
+        let filtered: Vec<_> = self
+            .current_os_assets()
+            .into_iter()
+            .filter(|asset| self.asset_matches_filter(&asset.tag, &asset.asset.name, asset.backend))
+            .collect();
+        if self.build_show_all {
+            return filtered;
+        }
+        limit_releases(filtered, self.visible_release_count())
+    }
+
+    /// Сколько разных тегов осталось после фильтра (для подписи «ещё N»).
+    fn total_filtered_tags(&self) -> usize {
+        self.current_os_assets()
+            .iter()
+            .filter(|asset| self.asset_matches_filter(&asset.tag, &asset.asset.name, asset.backend))
+            .map(|asset| asset.tag.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    }
+
+    fn visible_release_count(&self) -> usize {
+        5
     }
 
     /// Прочие файлы релизов (другие ОС/архитектуры) для ручного выбора,
@@ -1770,6 +1849,58 @@ fn format_size(bytes: u64) -> String {
         format!("{:.0} КБ", bytes / KB)
     } else {
         format!("{bytes} Б")
+    }
+}
+
+/// Обрезать список ассетов до первых `max_tags` разных тегов релизов
+/// (релизы идут от новых к старым).
+fn limit_releases(assets: Vec<github::BuildAsset>, max_tags: usize) -> Vec<github::BuildAsset> {
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    assets
+        .into_iter()
+        .filter(|asset| {
+            if seen.len() < max_tags || seen.contains(&asset.tag) {
+                seen.insert(asset.tag.clone());
+                true
+            } else {
+                false
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn asset_with_tag(tag: &str) -> github::BuildAsset {
+        github::BuildAsset {
+            asset: github::Asset {
+                name: format!("llama-{tag}-bin-ubuntu-x64.tar.gz"),
+                browser_download_url: "https://unused".into(),
+                size: 1,
+            },
+            tag: tag.into(),
+            os: Some(github::TargetOs::Linux),
+            arch: Some(github::Arch::X64),
+            backend: github::Backend::Cpu,
+            runtime_asset: None,
+        }
+    }
+
+    #[test]
+    fn limit_releases_keeps_all_assets_of_first_tags() {
+        let mut assets = Vec::new();
+        for tag in ["b90", "b89", "b88", "b87", "b86", "b85", "b84"] {
+            assets.push(asset_with_tag(tag));
+            assets.push(asset_with_tag(tag)); // по два бэкенда на релиз
+        }
+        let limited = limit_releases(assets.clone(), 5);
+        // Первые 5 тегов целиком (10 ассетов), остальные 4 — отброшены.
+        assert_eq!(limited.len(), 10);
+        assert!(limited.iter().all(|a| !["b85", "b84"].contains(&a.tag.as_str())));
+
+        assert_eq!(limit_releases(assets, 10).len(), 14);
     }
 }
 
