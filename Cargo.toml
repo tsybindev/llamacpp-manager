@@ -13,7 +13,7 @@ egui_extras = { version = "0.36.1", default-features = false }
 flate2 = "1.1.10"
 log = "0.4.34"
 rfd = "0.17.2"
-serde = "1.0.229"
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 shlex = "2.0.1"
 tar = "0.4.46"
