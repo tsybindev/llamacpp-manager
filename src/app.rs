@@ -88,6 +88,8 @@ pub struct App {
     build_show_all: bool,
     /// Текущее скачивание/установка сборки, если идёт.
     build_download: Option<BuildDownload>,
+    /// Сборка, ожидающая подтверждения удаления (второй щелчок).
+    build_delete_armed: Option<PathBuf>,
     /// Fresh catalog fetched in the background, picked up on the next frame.
     catalog_refresh: std::sync::Arc<std::sync::Mutex<Option<ParamsCatalog>>>,
 }
@@ -232,6 +234,7 @@ impl App {
             build_filter: String::new(),
             build_show_all: false,
             build_download: None,
+            build_delete_armed: None,
             catalog_refresh,
             settings,
             applied_theme: None,
@@ -1094,6 +1097,34 @@ impl App {
                 {
                     self.activate_build_binary(build.tag.clone(), bin);
                 }
+
+                let armed = self.build_delete_armed.as_deref() == Some(build.dir.as_path());
+                let button_label = if armed { "Точно удалить?" } else { "Удалить" };
+                if ui
+                    .button(button_label)
+                    .on_hover_text(format!("Удалить каталог сборки\n{}", build.dir.display()))
+                    .clicked()
+                {
+                    if armed {
+                        self.delete_build(build);
+                    } else {
+                        self.build_delete_armed = Some(build.dir.clone());
+                    }
+                }
+                // Предупреждение: на эту сборку ссылаются пресеты.
+                if armed {
+                    let affected = self.presets_using_dir(&build.dir);
+                    if !affected.is_empty() {
+                        ui.label(
+                            RichText::new(format!(
+                                "используется в пресетах: {} — их настройка бинарника станет нерабочей",
+                                affected.join(", ")
+                            ))
+                            .small()
+                            .color(theme::WARN_YELLOW),
+                        );
+                    }
+                }
             });
         }
         ui.add_space(12.0);
@@ -1507,6 +1538,38 @@ impl App {
             self.mark_dirty();
         }
         log::info!("Активная сборка: {tag} ({})", binary.display());
+    }
+
+    /// Имена пресетов, чей бинарник лежит внутри каталога сборки.
+    fn presets_using_dir(&self, dir: &std::path::Path) -> Vec<String> {
+        self.presets
+            .list()
+            .into_iter()
+            .filter(|name| {
+                self.presets
+                    .load(name)
+                    .is_ok_and(|preset| preset.binary.starts_with(dir))
+            })
+            .collect()
+    }
+
+    /// Удалить установленную сборку с диска. Если её бинарник был активным —
+    /// сбросить конфигурацию; о пресетах пользователь предупреждён заранее.
+    fn delete_build(&mut self, build: &builds::InstalledBuild) {
+        if self.server_form.binary.starts_with(&build.dir) {
+            self.server_form.binary = PathBuf::new();
+            self.mark_dirty();
+            log::warn!(
+                "Удалённая сборка была активной — бинарник сервера сброшен, укажите другой"
+            );
+        }
+        match std::fs::remove_dir_all(&build.dir) {
+            Ok(()) => log::info!("Сборка {} удалена ({})", build.label(), build.dir.display()),
+            Err(e) => log::error!(
+                "Не удалось удалить {}: {e:#}",
+                build.dir.display()
+            ),
+        }
     }
 
     fn settings_page(&mut self, ui: &mut egui::Ui) {
