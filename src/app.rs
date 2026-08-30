@@ -104,6 +104,8 @@ pub struct App {
     hf_error: Option<String>,
     /// Текущее скачивание файла модели, если идёт.
     model_download: Option<ModelDownload>,
+    /// Файл модели, ожидающий подтверждения удаления (второй щелчок).
+    model_delete_armed: Option<PathBuf>,
     /// Кэш прочитанного GGUF-заголовка для текущего пути модели.
     model_info_cache: Option<(PathBuf, Option<gguf::GgufInfo>)>,
     /// Fresh catalog fetched in the background, picked up on the next frame.
@@ -276,6 +278,7 @@ impl App {
             hf_files_rx: None,
             hf_error: None,
             model_download: None,
+            model_delete_armed: None,
             model_info_cache: None,
             catalog_refresh,
             settings,
@@ -1096,6 +1099,10 @@ impl App {
         self.poll_hf_files();
         self.poll_model_download();
 
+        // Библиотека — наверху, как «Установленные сборки» на странице «Сборки».
+        self.model_library_section(ui);
+        ui.add_space(12.0);
+
         ui.heading(RichText::new("Поиск GGUF-моделей на HuggingFace").size(16.0));
         ui.horizontal(|ui| {
             let response = ui.add(
@@ -1157,20 +1164,70 @@ impl App {
                 });
             }
             let files = self.hf_files.clone();
+            let mut clear_download = false;
             for file in &files {
+                let dest = self.settings.models_dir.join(&file.path);
+                let downloaded = dest.is_file();
                 ui.horizontal(|ui| {
                     ui.label(&file.path);
                     if let Some(quant) = huggingface::quant_from_filename(&file.path) {
                         ui.label(RichText::new(quant).small().color(theme::ACCENT));
                     }
                     ui.label(RichText::new(format_size(file.size)).small().weak());
-                    if ui
+                    if downloaded {
+                        ui.label(
+                            RichText::new("скачана")
+                                .small()
+                                .color(theme::OK_GREEN),
+                        );
+                    }
+                    // Прогресс — прямо в строке файла.
+                    if self.is_downloading_model(&file.path)
+                        && let Some(download) = self.model_download.as_ref()
+                    {
+                        let fraction = if download.total > 0 {
+                            download.downloaded as f32 / download.total as f32
+                        } else {
+                            0.0
+                        };
+                        ui.add(
+                            egui::ProgressBar::new(fraction)
+                                .show_percentage()
+                                .desired_width(160.0),
+                        );
+                        ui.label(
+                            RichText::new(format!(
+                                "{} из {}",
+                                format_size(download.downloaded),
+                                if download.total > 0 {
+                                    format_size(download.total)
+                                } else {
+                                    "?".into()
+                                }
+                            ))
+                            .small()
+                            .weak(),
+                        );
+                    } else if let Some(download) = self.model_download.as_ref()
+                        && download.error.is_some()
+                        && download.path == file.path
+                    {
+                        ui.label(
+                            RichText::new(download.error.clone().unwrap_or_default())
+                                .small()
+                                .color(theme::ERR_RED),
+                        );
+                        if ui.small_button("Скрыть").clicked() {
+                            clear_download = true;
+                        }
+                    } else if ui
                         .add_enabled(
-                            !self.is_downloading_model(&file.path),
-                            egui::Button::new("Скачать"),
+                            self.model_download.is_none(),
+                            egui::Button::new(if downloaded { "Перекачать" } else { "Скачать" }),
                         )
                         .on_hover_text(format!(
-                            "Скачать в {}\n{}",
+                            "{} в {}\n{}",
+                            if downloaded { "Скачать заново" } else { "Скачать" },
                             self.settings.models_dir.display(),
                             file.path
                         ))
@@ -1180,11 +1237,12 @@ impl App {
                     }
                 });
             }
-            self.model_download_panel(ui);
+            if clear_download {
+                self.model_download = None;
+            }
         }
 
         ui.add_space(12.0);
-        self.model_library_section(ui);
     }
 
     /// Локальная библиотека моделей: gguf-файлы в models_dir (глубина 2).
@@ -1222,51 +1280,76 @@ impl App {
                     self.mark_dirty();
                     log::info!("Активная модель: {}", path.display());
                 }
+
+                let armed = self.model_delete_armed.as_deref() == Some(path.as_path());
+                let button_label = if armed { "Точно удалить?" } else { "Удалить" };
+                if ui
+                    .button(button_label)
+                    .on_hover_text(format!("Удалить файл с диска\n{}", path.display()))
+                    .clicked()
+                {
+                    if armed {
+                        self.delete_model_file(&path);
+                    } else {
+                        self.model_delete_armed = Some(path.clone());
+                    }
+                }
+                if armed {
+                    let affected = self.presets_using_model(&path);
+                    if !affected.is_empty() {
+                        ui.label(
+                            RichText::new(format!(
+                                "используется в пресетах: {} — их настройка модели станет нерабочей",
+                                affected.join(", ")
+                            ))
+                            .small()
+                            .color(theme::WARN_YELLOW),
+                        );
+                    }
+                }
             });
         }
     }
 
-    /// Панель прогресса/ошибки скачивания файла модели.
-    fn model_download_panel(&mut self, ui: &mut egui::Ui) {
-        let mut clear_download = false;
-        if let Some(download) = self.model_download.as_mut() {
-            ui.group(|ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(format!("{}/{}", download.repo, download.path)).strong(),
-                    );
-                    if let Some(error) = &download.error {
-                        ui.label(RichText::new(error).color(theme::ERR_RED));
-                        if ui.small_button("Скрыть").clicked() {
-                            clear_download = true;
-                        }
-                    }
-                });
-                if download.error.is_none() {
-                    let fraction = if download.total > 0 {
-                        download.downloaded as f32 / download.total as f32
-                    } else {
-                        0.0
-                    };
-                    ui.add(
-                        egui::ProgressBar::new(fraction)
-                            .show_percentage()
-                            .desired_width(ui.available_width()),
-                    );
-                    ui.label(format!(
-                        "{} из {}",
-                        format_size(download.downloaded),
-                        if download.total > 0 {
-                            format_size(download.total)
-                        } else {
-                            "?".to_string()
-                        }
-                    ));
-                }
-            });
+    /// Имена пресетов, использующих файл модели (как основную модель
+    /// или как Path-параметр: draft/mmproj и т.п.).
+    fn presets_using_model(&self, path: &std::path::Path) -> Vec<String> {
+        fn value_is_path(value: &serde_json::Value, path: &std::path::Path) -> bool {
+            value
+                .as_str()
+                .is_some_and(|s| std::path::Path::new(s) == path)
         }
-        if clear_download {
-            self.model_download = None;
+        self.presets
+            .list()
+            .into_iter()
+            .filter(|name| {
+                self.presets.load(name).is_ok_and(|preset| {
+                    preset.model == path
+                        || preset
+                            .params
+                            .entries
+                            .values()
+                            .any(|entry| {
+                                entry
+                                    .value
+                                    .as_ref()
+                                    .is_some_and(|v| value_is_path(v, path))
+                            })
+                })
+            })
+            .collect()
+    }
+
+    /// Удалить файл модели с диска. Если он был активной моделью — сбросить.
+    fn delete_model_file(&mut self, path: &std::path::Path) {
+        if self.server_form.model == path {
+            self.server_form.model = PathBuf::new();
+            self.mark_dirty();
+            log::warn!("Удалённая модель была активной — файл модели сброшен, укажите другой");
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => log::info!("Модель удалена: {}", path.display()),
+            Err(e) => log::error!("Не удалось удалить {}: {e:#}", path.display()),
         }
     }
 
