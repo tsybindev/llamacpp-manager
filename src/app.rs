@@ -63,6 +63,9 @@ pub struct App {
     presets: presets::PresetStore,
     /// Preset picked in the combo box, if any.
     selected_preset: Option<String>,
+    /// Mirror of `selected_preset` to detect selection changes and sync
+    /// the name input field with the picked preset.
+    mirrored_preset: Option<String>,
     /// Name input used for save/rename/import operations.
     preset_name_edit: String,
     /// Second-click confirmation state for the delete button.
@@ -184,6 +187,7 @@ impl App {
             params_catalog,
             presets: presets::PresetStore::new(presets_dir),
             selected_preset: None,
+            mirrored_preset: None,
             preset_name_edit: String::new(),
             preset_delete_armed: false,
             preset_msg: None,
@@ -268,21 +272,84 @@ impl App {
 
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
             ui.add_space(8.0);
-            if !self.sidebar_collapsed {
-                ui.separator();
-                ui.add_space(4.0);
-                ui.label("Тема:");
-                for mode in ThemeMode::ALL {
-                    if ui
-                        .selectable_label(self.settings.theme == mode, mode.label())
-                        .clicked()
-                    {
-                        self.settings.theme = mode;
-                        self.mark_dirty();
+            ui.separator();
+            ui.add_space(4.0);
+            self.sidebar_server_block(ui);
+        });
+    }
+
+    /// Persistent server status and control buttons at the bottom of the
+    /// sidebar, so they are reachable from any page without scrolling.
+    fn sidebar_server_block(&mut self, ui: &mut egui::Ui) {
+        let collapsed = self.sidebar_collapsed;
+        let state = self.server.state();
+        let (color, hint) = state_status(state);
+        let running = self.server.is_running();
+        let has_config = self.server.config().is_some();
+
+        if collapsed {
+            ui.add_sized(
+                [ui.available_width(), 20.0],
+                egui::Label::new(RichText::new("●").color(color).size(16.0)),
+            )
+            .on_hover_text(format!("Сервер: {}", state.label()));
+            for (icon, tooltip, enabled, action) in [
+                ("▶", "Запустить сервер", !running, 0),
+                ("■", "Остановить сервер", running, 1),
+                ("↻", "Перезапустить сервер", has_config, 2),
+            ] {
+                let button = if enabled {
+                    egui::Button::new(icon)
+                } else {
+                    egui::Button::new(RichText::new(icon).weak())
+                };
+                let clicked = ui
+                    .add_sized([ui.available_width(), 24.0], button)
+                    .on_hover_text(tooltip)
+                    .clicked();
+                if clicked && enabled {
+                    match action {
+                        0 => self.try_start_server(),
+                        1 => self.server.stop(),
+                        _ => self.try_restart_server(),
                     }
                 }
             }
-        });
+        } else {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("●").color(color).size(16.0))
+                    .on_hover_text(hint);
+                ui.label(RichText::new(state.label()).strong());
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!running, egui::Button::new("▶"))
+                    .on_hover_text("Запустить сервер")
+                    .clicked()
+                {
+                    self.try_start_server();
+                }
+                if ui
+                    .add_enabled(running, egui::Button::new("■"))
+                    .on_hover_text("Остановить сервер")
+                    .clicked()
+                {
+                    self.server.stop();
+                }
+                if ui
+                    .add_enabled(has_config, egui::Button::new("↻"))
+                    .on_hover_text("Перезапустить сервер")
+                    .clicked()
+                {
+                    self.try_restart_server();
+                }
+                if let Some(error) = self.server_form.last_error.as_ref() {
+                    ui.label(RichText::new(error).small().color(theme::ERR_RED))
+                        .on_hover_text(error);
+                }
+            });
+        }
     }
 
     fn page_content(&mut self, ui: &mut egui::Ui) {
@@ -308,7 +375,9 @@ impl App {
         self.app_log_panel(ui);
     }
 
-    /// Preset management: load, save, rename, delete, import/export.
+    /// Preset management: load, save-as, rename, delete, import/export.
+    /// While a preset is selected, any configuration change is auto-saved
+    /// into it (see the debounce block in `ui`).
     fn presets_section(&mut self, ui: &mut egui::Ui) {
         ui.heading(RichText::new("Пресеты").size(16.0));
         let names = self.presets.list();
@@ -319,8 +388,15 @@ impl App {
             self.selected_preset = None;
             self.preset_delete_armed = false;
         }
+        // Sync the name field whenever the combo box selection changes.
+        if self.selected_preset != self.mirrored_preset {
+            self.mirrored_preset = self.selected_preset.clone();
+            self.preset_name_edit = self.selected_preset.clone().unwrap_or_default();
+            self.preset_delete_armed = false;
+        }
         let selection = self.selected_preset.clone();
         let has_selection = selection.is_some();
+        let typed_name = self.preset_name_edit.trim().to_string();
 
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -364,28 +440,48 @@ impl App {
                     .hint_text("например: gemma-mtp-локально"),
             );
             if ui
-                .add_enabled(!self.preset_name_edit.trim().is_empty(), egui::Button::new("Сохранить"))
+                .add_enabled(
+                    !typed_name.is_empty(),
+                    egui::Button::new("Сохранить как новый"),
+                )
                 .on_hover_text("Сохранить текущую конфигурацию и параметры под введённым именем")
                 .clicked()
             {
                 self.save_current_as_preset();
             }
+            let name_differs = has_selection && selection.as_deref() != Some(typed_name.as_str());
             if ui
-                .add_enabled(has_selection && !self.preset_name_edit.trim().is_empty(), egui::Button::new("Переименовать"))
-                .on_hover_text("Переименовать выбранный пресет в имя из поля")
+                .add_enabled(
+                    name_differs,
+                    egui::Button::new("Переименовать"),
+                )
+                .on_hover_text(format!(
+                    "Переименовать «{}» в «{typed_name}»",
+                    selection.as_deref().unwrap_or("")
+                ))
                 .clicked()
             {
                 self.preset_delete_armed = false;
                 self.rename_selected_preset();
             }
-            if ui.button("Экспорт в файл…").clicked() {
+            if ui.button("Экспорт…").clicked() {
                 self.export_selected_preset();
             }
-            if ui.button("Импорт из файла…").clicked() {
+            if ui.button("Импорт…").clicked() {
                 self.import_preset_file();
             }
         });
 
+        if has_selection {
+            ui.label(
+                RichText::new(format!(
+                    "Изменения конфигурации и параметров автоматически сохраняются в пресет «{}».",
+                    selection.unwrap()
+                ))
+                .small()
+                .weak(),
+            );
+        }
         if let Some((is_error, message)) = &self.preset_msg {
             let color = if *is_error { theme::ERR_RED } else { theme::OK_GREEN };
             ui.label(RichText::new(message).color(color).small());
@@ -565,13 +661,7 @@ impl App {
 
     fn server_status_bar(&mut self, ui: &mut egui::Ui) {
         let state = self.server.state();
-        let (color, hint) = match state {
-            ServerState::Stopped => (Color32::from_rgb(0x8A, 0x94, 0xA6), "Сервер не запущен"),
-            ServerState::Starting => (theme::WARN_YELLOW, "Идёт загрузка модели, проверяется готовность…"),
-            ServerState::Ready => (theme::OK_GREEN, "Сервер отвечает и готов принимать запросы"),
-            ServerState::RestartScheduled => (theme::WARN_YELLOW, "Процесс упал, ожидается автоматический перезапуск"),
-            ServerState::Crashed => (theme::ERR_RED, "Требуется вмешательство пользователя"),
-        };
+        let (color, hint) = state_status(state);
         ui.horizontal(|ui| {
             ui.label(RichText::new("●").color(color).size(18.0));
             ui.label(RichText::new(state.label()).size(16.0).strong());
@@ -592,6 +682,29 @@ impl App {
                     open_url(&url);
                 }
             });
+        }
+        if let Some(error) = &self.server_form.last_error {
+            ui.label(RichText::new(error).color(theme::ERR_RED).small());
+        }
+    }
+
+    fn try_start_server(&mut self) {
+        self.server_form.last_error = None;
+        let config = self.server_form.to_config(self.build_extra_args());
+        if let Err(e) = self
+            .pre_flight_check(&config)
+            .and_then(|()| self.server.start(config))
+        {
+            log::error!("Запуск не удался: {e}");
+            self.server_form.last_error = Some(e);
+        }
+    }
+
+    fn try_restart_server(&mut self) {
+        self.server_form.last_error = None;
+        if let Err(e) = self.server.restart() {
+            log::error!("Перезапуск не удался: {e}");
+            self.server_form.last_error = Some(e);
         }
     }
 
@@ -697,38 +810,6 @@ impl App {
             .monospace()
             .small(),
         );
-
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            let running = self.server.is_running();
-            if ui.add_enabled(!running, egui::Button::new(RichText::new("▶ Запустить").color(theme::OK_GREEN)))
-                .clicked()
-            {
-                self.server_form.last_error = None;
-                let config = self.server_form.to_config(self.build_extra_args());
-                if let Err(e) = self.pre_flight_check(&config).and_then(|()| self.server.start(config)) {
-                    self.server_form.last_error = Some(e);
-                }
-            }
-            if ui
-                .add_enabled(running, egui::Button::new("■ Остановить"))
-                .clicked()
-            {
-                self.server.stop();
-            }
-            if ui
-                .add_enabled(self.server.config().is_some(), egui::Button::new("↻ Перезапустить"))
-                .clicked()
-            {
-                self.server_form.last_error = None;
-                if let Err(e) = self.server.restart() {
-                    self.server_form.last_error = Some(e);
-                }
-            }
-            if let Some(error) = &self.server_form.last_error {
-                ui.label(RichText::new(error).color(theme::ERR_RED).small());
-            }
-        });
     }
 
     fn server_log_panel(&mut self, ui: &mut egui::Ui) {
@@ -1191,6 +1272,27 @@ fn path_row(ui: &mut egui::Ui, label: &str, path: &mut PathBuf, hint: &str, pick
     changed
 }
 
+/// Color and human hint for a server state, shared by the sidebar and the
+/// status bar on the Server page.
+fn state_status(state: ServerState) -> (Color32, &'static str) {
+    match state {
+        ServerState::Stopped => (Color32::from_rgb(0x8A, 0x94, 0xA6), "Сервер не запущен"),
+        ServerState::Starting => (
+            theme::WARN_YELLOW,
+            "Идёт загрузка модели, проверяется готовность…",
+        ),
+        ServerState::Ready => (
+            theme::OK_GREEN,
+            "Сервер отвечает и готов принимать запросы",
+        ),
+        ServerState::RestartScheduled => (
+            theme::WARN_YELLOW,
+            "Процесс упал, ожидается автоматический перезапуск",
+        ),
+        ServerState::Crashed => (theme::ERR_RED, "Требуется вмешательство пользователя"),
+    }
+}
+
 fn level_color(level: log::Level) -> Color32 {
     match level {
         log::Level::Error => theme::ERR_RED,
@@ -1248,6 +1350,13 @@ impl eframe::App for App {
                 .is_some_and(|t| t.elapsed() >= Duration::from_millis(500))
         {
             self.save_settings();
+            // Persist the same changes into the selected preset, if any.
+            if let Some(name) = self.selected_preset.clone() {
+                let preset = self.current_preset(name.clone());
+                if let Err(e) = self.presets.save(&preset) {
+                    self.set_preset_msg(true, format!("Не удалось автосохранить пресет: {e:#}"));
+                }
+            }
         }
 
         let nav_width = if self.sidebar_collapsed { 56.0 } else { 200.0 };
