@@ -32,6 +32,9 @@ pub struct ParamDef {
     pub min: Option<f64>,
     #[serde(default)]
     pub max: Option<f64>,
+    /// Slider step: value snaps to a `min + k*step` grid (None = default: 1 for int, continuous for float).
+    #[serde(default)]
+    pub step: Option<f64>,
     #[serde(default)]
     pub options: Vec<String>,
     /// Whether the parameter starts enabled. Bool parameters with a llama.cpp

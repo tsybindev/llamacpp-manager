@@ -482,14 +482,13 @@ pub fn param_row(
                         if min >= 0 && min < max && ui.available_width() > 100.0 {
                             let slider_width = (ui.available_width() - 8.0).min(260.0);
                             ui.style_mut().spacing.slider_width = slider_width;
-                            changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut v, min..=max)
-                                        .integer()
-                                        .show_value(false),
-                                )
-                                .on_hover_text(&tooltip)
-                                .changed();
+                            let mut slider = egui::Slider::new(&mut v, min..=max)
+                                .integer()
+                                .show_value(false);
+                            if let Some(step) = def.step {
+                                slider = slider.step_by(step);
+                            }
+                            changed |= ui.add(slider).on_hover_text(&tooltip).changed();
                         }
                         if changed || clamped {
                             Some(serde_json::json!(v))
@@ -514,14 +513,13 @@ pub fn param_row(
                         if min >= 0.0 && min < max && ui.available_width() > 100.0 {
                             let slider_width = (ui.available_width() - 8.0).min(260.0);
                             ui.style_mut().spacing.slider_width = slider_width;
-                            changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut v, min..=max)
-                                        .fixed_decimals(2)
-                                        .show_value(false),
-                                )
-                                .on_hover_text(&tooltip)
-                                .changed();
+                            let mut slider = egui::Slider::new(&mut v, min..=max)
+                                .fixed_decimals(2)
+                                .show_value(false);
+                            if let Some(step) = def.step {
+                                slider = slider.step_by(step);
+                            }
+                            changed |= ui.add(slider).on_hover_text(&tooltip).changed();
                         }
                         if changed {
                             Some(serde_json::json!(v))
