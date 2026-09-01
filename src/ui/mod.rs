@@ -483,7 +483,11 @@ pub fn param_row(
                             let slider_width = (ui.available_width() - 8.0).min(260.0);
                             ui.style_mut().spacing.slider_width = slider_width;
                             changed |= ui
-                                .add(egui::Slider::new(&mut v, min..=max).integer())
+                                .add(
+                                    egui::Slider::new(&mut v, min..=max)
+                                        .integer()
+                                        .show_value(false),
+                                )
                                 .on_hover_text(&tooltip)
                                 .changed();
                         }
@@ -511,7 +515,11 @@ pub fn param_row(
                             let slider_width = (ui.available_width() - 8.0).min(260.0);
                             ui.style_mut().spacing.slider_width = slider_width;
                             changed |= ui
-                                .add(egui::Slider::new(&mut v, min..=max).fixed_decimals(2))
+                                .add(
+                                    egui::Slider::new(&mut v, min..=max)
+                                        .fixed_decimals(2)
+                                        .show_value(false),
+                                )
                                 .on_hover_text(&tooltip)
                                 .changed();
                         }
