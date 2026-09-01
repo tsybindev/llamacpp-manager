@@ -1,7 +1,7 @@
 //! Определение объёма VRAM системы без внешних зависимостей.
 //!
 //! Источники (по приоритету):
-//! - AMD (Linux): `/sys/class/drm/card*/device/mem_info_vram_total` (килобайты);
+//! - AMD (Linux): `/sys/class/drm/card*/device/mem_info_vram_total` (байты);
 //! - NVIDIA: `nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits` (МиБ).
 //!
 //! Windows/кросс-вендор (Vulkan `ash` / `vulkaninfo` / `lspci`) — осознанно не
@@ -16,14 +16,14 @@ pub fn vram_total() -> Option<u64> {
     nvidia_smi_vram_total()
 }
 
-/// AMD (amdgpu): суммирует `mem_info_vram_total` по всем картам (KB → байты).
+/// AMD (amdgpu): суммирует `mem_info_vram_total` по всем картам (значение уже в байтах).
 ///
 /// Дискретная карта может быть не `card0` (например, iGPU + dGPU), поэтому
 /// перебираем все `card*`. Если amdgpu-карт нет (NVIDIA-машина), — None.
 #[cfg(target_os = "linux")]
 fn amdgpu_vram_total() -> Option<u64> {
     let cards = std::fs::read_dir("/sys/class/drm").ok()?;
-    let mut total_kb: u64 = 0;
+    let mut total_bytes: u64 = 0;
     let mut found = false;
     for entry in cards.flatten() {
         let file_name = entry.file_name();
@@ -37,16 +37,16 @@ fn amdgpu_vram_total() -> Option<u64> {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let Ok(kb) = text.trim().parse::<u64>() else {
+        let Ok(bytes) = text.trim().parse::<u64>() else {
             continue;
         };
-        total_kb = total_kb.saturating_add(kb);
+        total_bytes = total_bytes.saturating_add(bytes);
         found = true;
     }
     if !found {
         return None;
     }
-    Some(total_kb.saturating_mul(1024))
+    Some(total_bytes)
 }
 
 /// NVIDIA: суммирует `memory.total` по всем GPU (nvidia-smi, МиБ → байты).
@@ -112,12 +112,15 @@ mod tests {
         assert_eq!(parse_nvidia_smi("garbage\n16384\n").unwrap(), 16384 * MIB);
     }
 
-    /// Live-проверка на реальном железе: если VRAM есть — определяется.
+    /// Live-проверка на реальном железе: если VRAM есть — определяется и
+    /// имеет разумный порядок (байты, а не КБ: 16 ГиБ-карта ≈ 1.7e10, не 1.7e13).
     #[test]
     #[ignore = "зависит от наличия GPU; VRAM на CI не гарантирован"]
     fn vram_total_detects_hardware() {
         if let Some(total) = vram_total() {
-            assert!(total >= 1024 * 1024 * 1024, "VRAM подозрительно мал: {total}");
+            const GIB: u64 = 1024 * 1024 * 1024;
+            assert!(total >= GIB, "VRAM подозрительно мал: {total}");
+            assert!(total <= 256 * GIB, "VRAM подозрительно велик (ошибка юнитов?): {total}");
             println!("VRAM = {total} байт");
         }
     }
