@@ -4,6 +4,7 @@
 - Этап 9: полировка UI — визуальная проверка после второго раунда правок
 
 ## [x] Completed
+- 2026-09-01 17:05 — Релиз 0.1.3: версия в Cargo.toml/Cargo.lock, коммиты (фикс дубля поля ввода + step слайдеров) запушены, тег v0.1.3 → сборка релиза в CI.
 - 2026-09-01 16:45 — Вариант A: свой шаг слайдера на каждый параметр:
   - `params.rs`: `ParamDef.step: Option<f64>` (serde default — старые каталоги совместимы).
   - `assets/params_catalog.json`: step у 10 параметров — ctx-size 1024, batch-size 256, ubatch-size 16, cache-reuse 128, repeat-last-n 64, timeout 60, temp/top-p/min-p/repeat-penalty 0.01. Остальные int уже со шагом 1 (`.integer()`), менять нечего.
