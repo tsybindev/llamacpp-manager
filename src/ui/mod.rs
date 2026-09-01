@@ -413,11 +413,17 @@ pub fn param_row(
     def: &ParamDef,
     state: &mut ParamState,
     local_models: &[PathBuf],
+    model_ctx: Option<u64>,
 ) -> bool {
     let before = state.clone();
     let mut tooltip = format!("{}\n\nФлаг: {}", def.description, def.flag);
     if let Some(short) = &def.short {
         tooltip.push_str(&format!(" / {short}"));
+    }
+    if def.id == "ctx-size"
+        && let Some(ctx) = model_ctx
+    {
+        tooltip.push_str(&format!("\n\nОграничено контекстом модели: {ctx} токенов"));
     }
 
     match def.kind {
@@ -447,9 +453,23 @@ pub fn param_row(
                 let new_value = match def.kind {
                     ParamKind::Int => {
                         let min = def.min.unwrap_or(i64::MIN as f64) as i64;
-                        let max = def.max.unwrap_or(i64::MAX as f64).min(i64::MAX as f64) as i64;
+                        let cat_max = def.max.unwrap_or(i64::MAX as f64).min(i64::MAX as f64) as i64;
+                        // Для ctx-size верхняя граница — контекст загруженной модели.
+                        let max = if def.id == "ctx-size" {
+                            model_ctx.map_or(cat_max, |ctx| (ctx as i64).min(cat_max))
+                        } else {
+                            cat_max
+                        };
                         let mut v = value.and_then(|x| x.as_i64()).unwrap_or(min.max(0));
-                        if ui
+                        let mut clamped = false;
+                        if v > max {
+                            v = max;
+                            clamped = true;
+                        } else if v < min {
+                            v = min;
+                            clamped = true;
+                        }
+                        let mut changed = ui
                             .add_sized(
                                 [130.0, 20.0],
                                 egui::DragValue::new(&mut v)
@@ -458,8 +478,16 @@ pub fn param_row(
                                     .custom_parser(|s| s.trim().parse::<i64>().ok().map(|n| n as f64)),
                             )
                             .on_hover_text(&tooltip)
-                            .changed()
-                        {
+                            .changed();
+                        if min >= 0 && min < max && ui.available_width() > 100.0 {
+                            let slider_width = (ui.available_width() - 8.0).min(260.0);
+                            ui.style_mut().spacing.slider_width = slider_width;
+                            changed |= ui
+                                .add(egui::Slider::new(&mut v, min..=max).integer())
+                                .on_hover_text(&tooltip)
+                                .changed();
+                        }
+                        if changed || clamped {
                             Some(serde_json::json!(v))
                         } else {
                             None
@@ -469,7 +497,25 @@ pub fn param_row(
                         let min = def.min.unwrap_or(f64::MIN);
                         let max = def.max.unwrap_or(f64::MAX);
                         let mut v = value.and_then(|x| x.as_f64()).unwrap_or(min.max(0.0));
-                        if ui.add_sized([130.0, 20.0], egui::DragValue::new(&mut v).range(min..=max).speed(0.05).max_decimals(2)).on_hover_text(&tooltip).changed() {
+                        let mut changed = ui
+                            .add_sized(
+                                [130.0, 20.0],
+                                egui::DragValue::new(&mut v)
+                                    .range(min..=max)
+                                    .speed(0.05)
+                                    .max_decimals(2),
+                            )
+                            .on_hover_text(&tooltip)
+                            .changed();
+                        if min >= 0.0 && min < max && ui.available_width() > 100.0 {
+                            let slider_width = (ui.available_width() - 8.0).min(260.0);
+                            ui.style_mut().spacing.slider_width = slider_width;
+                            changed |= ui
+                                .add(egui::Slider::new(&mut v, min..=max).fixed_decimals(2))
+                                .on_hover_text(&tooltip)
+                                .changed();
+                        }
+                        if changed {
                             Some(serde_json::json!(v))
                         } else {
                             None

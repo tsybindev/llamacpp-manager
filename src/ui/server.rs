@@ -384,9 +384,14 @@ fn params_card(app: &mut App, ui: &mut egui::Ui) {
             .collect();
 
         let local_models = crate::app::library_models(&app.settings.models_dir);
+        // Максимально допустимый контекст — из GGUF-заголовка загруженной модели.
+        let model_ctx = app
+            .cached_gguf_info()
+            .and_then(|(_, info)| info)
+            .and_then(|info| info.ctx_train);
         let mut params_changed = false;
         for def in &defs {
-            params_changed |= param_row(ui, def, &mut app.settings.params, &local_models);
+            params_changed |= param_row(ui, def, &mut app.settings.params, &local_models, model_ctx);
         }
         if params_changed {
             app.mark_dirty();
