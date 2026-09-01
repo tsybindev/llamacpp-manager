@@ -8,8 +8,8 @@ use crate::params;
 use crate::process_mgr::ServerState;
 use crate::theme::{self, MUTED};
 use crate::ui::{
-    self, cli_preview, card, card_titled, format_size, gauge_color, memory_gauge, param_tabs,
-    param_row, path_row, state_status, status_dot, PathPick, GaugeSegment,
+    self, cli_preview, card, card_titled, format_size, gauge_color, memory_pool, param_tabs,
+    param_row, path_row, state_status, status_dot, PathPick, GaugeSegment, MemPool,
 };
 
 const KV_CACHE_COLOR: Color32 = Color32::from_rgb(0x81, 0x8C, 0xF8);
@@ -264,52 +264,90 @@ fn memory_section(app: &mut App, ui: &mut egui::Ui) {
     let Some((_, estimate)) = app.memory_estimate() else {
         return;
     };
-    let total_used = estimate.weights_bytes + estimate.kv_cache_bytes;
 
-    match ui::mem_info() {
-        Some((total, _available)) => {
-            memory_gauge(
-                ui,
-                total,
-                &[
+    // VRAM-пул знаменатель = VRAM (если определена), ОЗУ-пул — MemAvailable.
+    let vram = app.vram_total();
+    let (_ram_total, ram_available) = ui::mem_info().unwrap_or((0, 0));
+    let ram_pool = MemPool {
+        title: "ОЗУ (RAM)".into(),
+        total: ram_available,
+        segments: vec![
+            GaugeSegment {
+                label: "Веса".into(),
+                bytes: estimate.weights_cpu,
+                color: WEIGHTS_COLOR,
+            },
+            GaugeSegment {
+                label: "KV-кэш".into(),
+                bytes: estimate.kv_cpu,
+                color: KV_CACHE_COLOR,
+            },
+        ],
+    };
+
+    match vram {
+        Some(v) => {
+            let vram_pool = MemPool {
+                title: "VRAM".into(),
+                total: v,
+                segments: vec![
                     GaugeSegment {
                         label: "Веса".into(),
-                        bytes: estimate.weights_bytes,
+                        bytes: estimate.weights_gpu,
                         color: WEIGHTS_COLOR,
                     },
                     GaugeSegment {
                         label: "KV-кэш".into(),
-                        bytes: estimate.kv_cache_bytes,
+                        bytes: estimate.kv_gpu,
                         color: KV_CACHE_COLOR,
                     },
                 ],
-            );
+            };
+            memory_pool(ui, &vram_pool);
+            ui.add_space(10.0);
+            memory_pool(ui, &ram_pool);
         }
         None => {
-            // Нет данных о памяти системы — абсолютная оценка с порогами.
-            const GB: f64 = 1024.0 * 1024.0 * 1024.0;
-            let color = gauge_color((total_used as f64 / (16.0 * GB)) as f32);
+            // VRAM не определили: честно показываем только ОЗУ.
             ui.label(
-                RichText::new(format!(
-                    "Оценка: веса {} + KV-кэш {} (ctx {}) ≈ {}",
-                    format_size(estimate.weights_bytes),
-                    format_size(estimate.kv_cache_bytes),
-                    estimate.ctx_used,
-                    format_size(total_used),
-                ))
-                .size(12.0)
-                .color(color),
+                RichText::new("VRAM: не определена — показана только ОЗУ")
+                    .size(12.0)
+                    .color(theme::WARN_YELLOW),
             );
+            ui.add_space(6.0);
+            memory_pool(ui, &ram_pool);
         }
     }
-    let note = if estimate.gpu_bytes >= total_used {
+
+    // Итог «≈ Y VRAM / Z RAM» + пометка об offload; цвет — по худшему пулу.
+    let vram_fill = vram.map_or(0.0, |v| {
+        if v > 0 {
+            (estimate.gpu_bytes as f32 / v as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    });
+    let ram_fill = if ram_available > 0 {
+        (estimate.cpu_bytes as f32 / ram_available as f32).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let note = if estimate.gpu_bytes >= estimate.weights_bytes + estimate.kv_cache_bytes {
         "вся модель на GPU"
     } else if estimate.gpu_bytes > 0 {
         "частично на GPU"
     } else {
         "только CPU/RAM"
     };
-    ui.label(RichText::new(format!("{note} · приблизительная оценка")).size(11.0).color(MUTED));
+    ui.label(
+        RichText::new(format!(
+            "≈ {} VRAM / {} RAM · {note} · приблизительная оценка",
+            format_size(estimate.gpu_bytes),
+            format_size(estimate.cpu_bytes),
+        ))
+        .size(11.0)
+        .color(gauge_color(vram_fill.max(ram_fill))),
+    );
 }
 
 /// Параметры запуска во вкладках (вместо гармошек).

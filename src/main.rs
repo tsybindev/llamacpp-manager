@@ -11,6 +11,7 @@ mod presets;
 mod process_mgr;
 mod theme;
 mod ui;
+mod vram;
 
 use app::App;
 

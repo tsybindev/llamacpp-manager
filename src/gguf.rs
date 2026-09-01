@@ -35,8 +35,18 @@ pub struct MemoryEstimate {
     /// KV-кэш для указанного контекста.
     pub kv_cache_bytes: u64,
     pub ctx_used: u64,
-    /// Сколько памяти уходит на GPU (vulkan/cuda при -ngl > 0): всё.
+    /// Веса выгруженных в VRAM слоёв (доля от размера файла по ngl/n_layers).
+    pub weights_gpu: u64,
+    /// Веса CPU-слоёв (остаток после выгрузки).
+    pub weights_cpu: u64,
+    /// KV-кэш в VRAM (при ngl > 0) или в ОЗУ (при ngl = 0).
+    pub kv_gpu: u64,
+    /// KV-кэш в ОЗУ (при ngl = 0) или 0 (при ngl > 0).
+    pub kv_cpu: u64,
+    /// Итого в VRAM: weights_gpu + kv_gpu.
     pub gpu_bytes: u64,
+    /// Итого в ОЗУ: weights_cpu + kv_cpu.
+    pub cpu_bytes: u64,
 }
 
 /// Человеческая метка квантования по general.file_type (частичные данные спецификации).
@@ -163,15 +173,16 @@ fn read_header_from(reader: &mut impl Read) -> Result<GgufInfo> {
     Ok(info)
 }
 
-/// Оценить память: веса (размер файла) + KV-кэш.
+/// Оценить память: веса (размер файла) + KV-кэш, с разбивкой по GPU/CPU.
 /// `ctx_override` — контекст из параметров сервера, если включён;
-/// `kv_elem_bytes` — байт на элемент кэша (f16 = 2, q8_0 = 1, q4_0 ≈ 0.5).
+/// `kv_elem_bytes` — байт на элемент кэша (f16 = 2, q8_0 = 1, q4_0 ≈ 0.5);
+/// `ngl_effective` — сколько слоёв модели реально живёт в VRAM (0..=n_layers).
 pub fn estimate_memory(
     info: &GgufInfo,
     file_size: u64,
     ctx_override: Option<u64>,
     kv_elem_bytes: f64,
-    gpu_offload_all: bool,
+    ngl_effective: u64,
 ) -> Option<MemoryEstimate> {
     let layers = info.n_layers?;
     let ctx = ctx_override.or(info.ctx_train)?;
@@ -187,12 +198,23 @@ pub fn estimate_memory(
         0
     };
     let weights_bytes = file_size;
-    let total = weights_bytes + kv_cache_bytes;
+    // Веса выгруженных слоёв — пропорционально доле ngl/n_layers.
+    let ngl = ngl_effective.min(layers);
+    let weights_gpu = file_size.saturating_mul(ngl) / layers;
+    let weights_cpu = weights_bytes.saturating_sub(weights_gpu);
+    // KV-кэш живёт там, где живёт модель: при ngl > 0 — в VRAM, иначе в ОЗУ.
+    let kv_gpu = if ngl > 0 { kv_cache_bytes } else { 0 };
+    let kv_cpu = kv_cache_bytes.saturating_sub(kv_gpu);
     Some(MemoryEstimate {
         weights_bytes,
         kv_cache_bytes,
         ctx_used: ctx,
-        gpu_bytes: if gpu_offload_all { total } else { kv_cache_bytes },
+        weights_gpu,
+        weights_cpu,
+        kv_gpu,
+        kv_cpu,
+        gpu_bytes: weights_gpu + kv_gpu,
+        cpu_bytes: weights_cpu + kv_cpu,
     })
 }
 
@@ -377,23 +399,49 @@ mod tests {
         };
         let file_size = 4u64 * 1024 * 1024 * 1024; // 4 ГиБ весов
 
-        // Тренировочный контекст: kv_dim = 2048 * 2/8 = 512.
-        let est = estimate_memory(&info, file_size, None, 2.0, true).expect("оценка");
+        // Тренировочный контекст, полный offload (ngl = n_layers): всё в VRAM.
+        // kv_dim = 2048 * 2/8 = 512.
+        let est = estimate_memory(&info, file_size, None, 2.0, 35).expect("оценка");
         assert_eq!(est.ctx_used, 32768);
         let kv_expected = 2 * 35 * 32768 * 512 * 2;
         assert_eq!(est.kv_cache_bytes, kv_expected);
         assert_eq!(est.weights_bytes, file_size);
         assert_eq!(est.gpu_bytes, est.kv_cache_bytes + est.weights_bytes);
+        assert_eq!(est.cpu_bytes, 0);
 
-        // Переопределение контекста из параметров сервера.
-        let est = estimate_memory(&info, file_size, Some(8192), 2.0, false).expect("оценка");
+        // Только CPU (ngl = 0): всё в ОЗУ, контекст переопределён.
+        let est = estimate_memory(&info, file_size, Some(8192), 2.0, 0).expect("оценка");
         assert_eq!(est.ctx_used, 8192);
         assert_eq!(est.kv_cache_bytes, 2 * 35 * 8192 * 512 * 2);
+        assert_eq!(est.gpu_bytes, 0);
+        assert_eq!(est.cpu_bytes, est.kv_cache_bytes + est.weights_bytes);
+    }
+
+    #[test]
+    fn estimate_partial_offload_splits_weights() {
+        let info = GgufInfo {
+            version: 3,
+            tensor_count: 405,
+            arch: Some("gemma3n".into()),
+            n_layers: Some(20),
+            n_embd: Some(1024),
+            n_head: Some(16),
+            n_head_kv: Some(16),
+            ctx_train: Some(4096),
+            file_type: Some(15),
+        };
+        let file_size = 10u64 * 1024 * 1024 * 1024;
+        // ngl = 10 из 20: половина весов в VRAM, половина в ОЗУ.
+        let est = estimate_memory(&info, file_size, None, 2.0, 10).expect("оценка");
+        assert_eq!(est.weights_bytes, file_size);
+        assert_eq!(est.gpu_bytes, file_size / 2 + est.kv_cache_bytes);
+        assert_eq!(est.cpu_bytes, file_size / 2);
+        assert_eq!(est.gpu_bytes + est.cpu_bytes, est.weights_bytes + est.kv_cache_bytes);
     }
 
     #[test]
     fn estimate_requires_layers_and_ctx() {
         let empty = GgufInfo::default();
-        assert!(estimate_memory(&empty, 1000, None, 2.0, true).is_none());
+        assert!(estimate_memory(&empty, 1000, None, 2.0, 999).is_none());
     }
 }

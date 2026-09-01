@@ -4,6 +4,14 @@
 - Этап 9: полировка UI — визуальная проверка после второго раунда правок
 
 ## [x] Completed
+- 2026-09-01 14:52 — Этап 10: VRAM в оценке памяти (гейдж «Конфигурация» против VRAM, а не против всей ОЗУ):
+  - Причина: гейдж считал против MemTotal (вся ОЗУ) — «свободно 57.1 ГБ» на машине 64 ГБ / RX 6800 XT 16 ГБ; модель на 90% VRAM показывалась зелёной (пороги цвета 80/95% тоже от ОЗУ). VRAM-детект отсутствовал; при частичном offload (ngl < слоёв) `gpu_bytes` учитывал только KV-кэш, а не веса выгруженных слоёв.
+  - `vram.rs` (новый модуль, без внешних зависимостей): VRAM = amdgpu `/sys/class/drm/card*/device/mem_info_vram_total` (КБ, суммирует все card*) + `nvidia-smi --query-gpu=memory.total` (МиБ). Windows/кросс-вендор (ash/vulkaninfo/lspci) — осознанно не реализовано до приоритета Windows.
+  - `gguf.rs`: `MemoryEstimate` с разбивкой по пулам — `weights_gpu/cpu`, `kv_gpu/cpu`, `gpu_bytes`/`cpu_bytes`; `estimate_memory` принимает `ngl_effective` (0..=n_layers): `weights_gpu = file_size × ngl/n_layers`, KV живёт там, где модель (ngl > 0 → VRAM, иначе ОЗУ).
+  - `app.rs`: `vram_total()` (кэш `vram_total_cache`) + `ngl_effective` (ngl не задан = все слои, дефолт llama.cpp 999); попутно унес `mod tests` в конец файла (clippy items_after_test_module).
+  - `ui/mod.rs`: `memory_gauge` → `MemPool` + `memory_pool` (заголовок пула, ёмкость, сегменты, «Свободно», цвет по заполнению).
+  - `ui/server.rs` `memory_section`: два пула — VRAM (знаменатель = VRAM, Веса-GPU + KV-GPU) и ОЗУ (знаменатель = MemAvailable, Веса-CPU + KV-CPU); итог «≈ Y VRAM / Z RAM · вся/частично/только-CPU · приблизительная оценка», цвет по худшему пулу; VRAM не определена → жёлтая строка «VRAM: не определена — показана только ОЗУ».
+  - cargo test 43 passed + 7 ignored, clippy чисто.
 - 2026-08-31 02:40 — Фикс страницы «Логи» + релизная инфраструктура:
   - Журнал llama-server и приложения теперь на всю ширину (ScrollArea auto_shrink=false) с вертикальной и горизонтальной прокруткой (ScrollArea::both, stick_to_bottom сохранён).
   - `.github/workflows/release.yml`: по тегу v* собираются релизные ассеты для Linux x64 (tar.gz, ubuntu-22.04) и Windows x64 (zip, windows-latest) и прикрепляются к GitHub Release (softprops/action-gh-release).

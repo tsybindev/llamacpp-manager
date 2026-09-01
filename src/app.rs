@@ -125,6 +125,8 @@ pub struct App {
     pub model_info_cache: Option<(PathBuf, Option<gguf::GgufInfo>)>,
     /// Кэш GGUF-заголовков для таблицы библиотеки моделей.
     pub gguf_cache: HashMap<PathBuf, Option<gguf::GgufInfo>>,
+    /// Кэш объёма VRAM системы: None = ещё не опрашивали, Some(None) = не определён.
+    pub vram_total_cache: Option<Option<u64>>,
     /// Fresh catalog fetched in the background, picked up on the next frame.
     pub catalog_refresh: std::sync::Arc<std::sync::Mutex<Option<ParamsCatalog>>>,
 }
@@ -305,6 +307,7 @@ impl App {
             model_delete_armed: None,
             model_info_cache: None,
             gguf_cache: HashMap::new(),
+            vram_total_cache: None,
             catalog_refresh,
             settings,
             applied_theme: None,
@@ -1414,16 +1417,31 @@ impl App {
         (cache_type_bytes("cache-type-k") + cache_type_bytes("cache-type-v")) / 2.0
     }
 
+    /// Объём VRAM системы в байтах (кэшируется; None — не определён).
+    pub fn vram_total(&mut self) -> Option<u64> {
+        if self.vram_total_cache.is_none() {
+            self.vram_total_cache = Some(crate::vram::vram_total());
+        }
+        self.vram_total_cache?
+    }
+
+    /// Эффективное число слоёв в VRAM: параметр ngl, иначе — все слои
+    /// (llama.cpp по умолчанию грузит всю модель в GPU).
+    fn ngl_effective(&self, n_layers: u64) -> u64 {
+        match self.param_u64("ngl") {
+            Some(ngl) => ngl.min(n_layers),
+            None => n_layers,
+        }
+    }
+
     /// Оценка памяти для текущей модели: (модель, оценка).
     pub fn memory_estimate(&mut self) -> Option<(gguf::GgufInfo, gguf::MemoryEstimate)> {
         let (path, info) = self.cached_gguf_info()?;
         let info = info?;
         let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        let gpu_offload_all = self
-            .param_u64("ngl")
-            .is_some_and(|ngl| info.n_layers.is_some_and(|layers| ngl >= layers) || ngl >= 999);
+        let ngl = self.ngl_effective(info.n_layers.unwrap_or(0));
         let estimate =
-            gguf::estimate_memory(&info, file_size, self.ctx_from_params(), self.kv_elem_bytes(), gpu_offload_all)?;
+            gguf::estimate_memory(&info, file_size, self.ctx_from_params(), self.kv_elem_bytes(), ngl)?;
         Some((info, estimate))
     }
 }
@@ -1472,41 +1490,6 @@ fn limit_releases(assets: Vec<github::BuildAsset>, max_tags: usize) -> Vec<githu
             }
         })
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn asset_with_tag(tag: &str) -> github::BuildAsset {
-        github::BuildAsset {
-            asset: github::Asset {
-                name: format!("llama-{tag}-bin-ubuntu-x64.tar.gz"),
-                browser_download_url: "https://unused".into(),
-                size: 1,
-            },
-            tag: tag.into(),
-            os: Some(github::TargetOs::Linux),
-            arch: Some(github::Arch::X64),
-            backend: github::Backend::Cpu,
-            runtime_asset: None,
-        }
-    }
-
-    #[test]
-    fn limit_releases_keeps_all_assets_of_first_tags() {
-        let mut assets = Vec::new();
-        for tag in ["b90", "b89", "b88", "b87", "b86", "b85", "b84"] {
-            assets.push(asset_with_tag(tag));
-            assets.push(asset_with_tag(tag)); // по два бэкенда на релиз
-        }
-        let limited = limit_releases(assets.clone(), 5);
-        // Первые 5 тегов целиком (10 ассетов), остальные 4 — отброшены.
-        assert_eq!(limited.len(), 10);
-        assert!(limited.iter().all(|a| !["b85", "b84"].contains(&a.tag.as_str())));
-
-        assert_eq!(limit_releases(assets, 10).len(), 14);
-    }
 }
 
 impl eframe::App for App {
@@ -1581,5 +1564,40 @@ impl eframe::App for App {
             }
             self.save_settings();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn asset_with_tag(tag: &str) -> github::BuildAsset {
+        github::BuildAsset {
+            asset: github::Asset {
+                name: format!("llama-{tag}-bin-ubuntu-x64.tar.gz"),
+                browser_download_url: "https://unused".into(),
+                size: 1,
+            },
+            tag: tag.into(),
+            os: Some(github::TargetOs::Linux),
+            arch: Some(github::Arch::X64),
+            backend: github::Backend::Cpu,
+            runtime_asset: None,
+        }
+    }
+
+    #[test]
+    fn limit_releases_keeps_all_assets_of_first_tags() {
+        let mut assets = Vec::new();
+        for tag in ["b90", "b89", "b88", "b87", "b86", "b85", "b84"] {
+            assets.push(asset_with_tag(tag));
+            assets.push(asset_with_tag(tag)); // по два бэкенда на релиз
+        }
+        let limited = limit_releases(assets.clone(), 5);
+        // Первые 5 тегов целиком (10 ассетов), остальные 4 — отброшены.
+        assert_eq!(limited.len(), 10);
+        assert!(limited.iter().all(|a| !["b85", "b84"].contains(&a.tag.as_str())));
+
+        assert_eq!(limit_releases(assets, 10).len(), 14);
     }
 }

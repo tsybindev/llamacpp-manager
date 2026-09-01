@@ -286,40 +286,48 @@ pub struct GaugeSegment {
     pub color: Color32,
 }
 
-/// Горизонтальный гейдж памяти: закрашенная часть — сумма сегментов,
-/// свободное место — приглушённое. Под баром — легенда `[ Веса | KV | Свободно ]`.
-pub fn memory_gauge(ui: &mut Ui, total: u64, segments: &[GaugeSegment]) {
-    let used: u64 = segments.iter().map(|s| s.bytes).sum();
-    let fraction = if total > 0 { (used as f32 / total as f32).clamp(0.0, 1.0) } else { 0.0 };
-    let color = if fraction > 0.95 {
-        theme::ERR_RED
-    } else if fraction > 0.80 {
-        theme::WARN_YELLOW
-    } else {
-        theme::OK_GREEN
-    };
+/// Один пул памяти (VRAM или ОЗУ): заголовок, ёмкость и сегменты-займёвщики.
+pub struct MemPool {
+    pub title: String,
+    pub total: u64,
+    pub segments: Vec<GaugeSegment>,
+}
 
+/// Отрисовать пул памяти: заголовок, полоса-гейдж (сумма сегментов)
+/// и легенда `[ <сегменты> | Свободно ]`. Цвет строки — по заполнению
+/// (used / total): зелёный < 80%, жёлтый < 95%, красный выше.
+pub fn memory_pool(ui: &mut Ui, pool: &MemPool) {
+    let used: u64 = pool.segments.iter().map(|s| s.bytes).sum();
+    let fraction = if pool.total > 0 {
+        (used as f32 / pool.total as f32).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let color = gauge_color(fraction);
+
+    ui.label(RichText::new(pool.title.as_str()).size(12.5).strong());
     let height = 14.0;
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
     ui.painter().rect_filled(rect, RADIUS_WIDGET, theme::BG);
     ui.painter().rect_stroke(rect, RADIUS_WIDGET, Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
     let inner = rect.shrink2(Vec2::new(2.0, 3.0));
     let mut x = inner.left();
-    for segment in segments {
-        if total == 0 || segment.bytes == 0 {
+    for segment in &pool.segments {
+        if pool.total == 0 || segment.bytes == 0 {
             continue;
         }
-        let w = inner.width() * (segment.bytes as f32 / total as f32);
-        let seg_rect = egui::Rect::from_min_size(egui::Pos2::new(x, inner.top()), Vec2::new(w, inner.height()));
+        let w = inner.width() * (segment.bytes as f32 / pool.total as f32);
+        let seg_rect =
+            egui::Rect::from_min_size(egui::Pos2::new(x, inner.top()), Vec2::new(w, inner.height()));
         ui.painter().rect_filled(seg_rect, 2.0, segment.color);
         x += w;
     }
 
     let mut legend = String::new();
-    for segment in segments {
+    for segment in &pool.segments {
         legend.push_str(&format!("{}: {}   ", segment.label, format_size(segment.bytes)));
     }
-    legend.push_str(&format!("Свободно: {}", format_size(total.saturating_sub(used))));
+    legend.push_str(&format!("Свободно: {}", format_size(pool.total.saturating_sub(used))));
     ui.label(RichText::new(legend).size(12.0).color(color));
 }
 
